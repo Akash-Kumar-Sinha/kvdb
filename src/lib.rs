@@ -1,3 +1,3 @@
 mod btree;
-mod pager;
 mod kvdb;
+mod pager;

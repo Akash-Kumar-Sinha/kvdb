@@ -1,26 +1,24 @@
 use crate::btree::{BTree, Initialized, Locked, Uninitialized, Unlocked};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
-pub struct KvDb<S, T>
+pub struct KvDb<S, T, LockState = Unlocked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
     T: Clone + Serialize + DeserializeOwned,
 {
-    inner: BTree<S, T, Initialized, Unlocked>,
+    inner: BTree<S, T, Initialized, LockState>,
 }
 
-impl<S, T> KvDb<S, T>
+impl<S, T> KvDb<S, T, Unlocked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
     T: Clone + Serialize + DeserializeOwned,
 {
     pub fn open(path: &str) -> Self {
         let tree = BTree::<S, T, Uninitialized, Locked>::new(path);
-        KvDb { inner: tree.unlock() }
-    }
-
-    pub fn get(&mut self, key: &S) -> Option<T> {
-        self.inner.get(key)
+        KvDb {
+            inner: tree.unlock(),
+        }
     }
 
     pub fn put(&mut self, key: S, value: T) {
@@ -29,6 +27,34 @@ where
 
     pub fn delete(&mut self, key: S) -> (bool, Option<T>) {
         self.inner.delete(key)
+    }
+
+    pub fn lock(self) -> KvDb<S, T, Locked> {
+        KvDb {
+            inner: self.inner.lock(),
+        }
+    }
+}
+
+impl<S, T> KvDb<S, T, Locked>
+where
+    S: Ord + Clone + Serialize + DeserializeOwned,
+    T: Clone + Serialize + DeserializeOwned,
+{
+    pub fn unlock(self) -> KvDb<S, T, Unlocked> {
+        KvDb {
+            inner: self.inner.unlock(),
+        }
+    }
+}
+
+impl<S, T, LockState> KvDb<S, T, LockState>
+where
+    S: Ord + Clone + Serialize + DeserializeOwned,
+    T: Clone + Serialize + DeserializeOwned,
+{
+    pub fn get(&mut self, key: &S) -> Option<T> {
+        self.inner.get(key)
     }
 
     pub fn range(&mut self) -> Vec<(S, T)> {
@@ -66,7 +92,10 @@ mod tests {
 
         let range = db.range();
         let expected: Vec<(i32, i32)> = (1..=12).map(|i| (i, i * 10)).collect();
-        assert_eq!(range, expected, "range() must return sorted (key, value) pairs");
+        assert_eq!(
+            range, expected,
+            "range() must return sorted (key, value) pairs"
+        );
 
         assert_eq!(db.len(), 12);
 
@@ -91,8 +120,25 @@ mod tests {
     }
 
     #[test]
+    fn test_kvdb_lock_unlock_round_trip() {
+        let path = "/tmp/test_kvdb_lock.db";
+        fresh_path(path);
+
+        let mut db = KvDb::<i32, i32>::open(path);
+        db.put(1, 100);
+
+        let mut db = db.lock();
+        assert_eq!(db.get(&1), Some(100), "get must still work while locked");
+
+        let mut db = db.unlock();
+        db.put(2, 200);
+        assert_eq!(db.get(&2), Some(200));
+
+        fresh_path(path);
+    }
+
+    #[test]
     fn test_kvdb_string_keys_and_values() {
-       
         let path = "/tmp/test_kvdb_strings.db";
         fresh_path(path);
 
