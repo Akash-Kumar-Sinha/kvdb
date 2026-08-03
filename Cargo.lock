@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "serde",
+ "spinlock",
 ]
 
 [[package]]
@@ -74,6 +75,10 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "spinlock"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

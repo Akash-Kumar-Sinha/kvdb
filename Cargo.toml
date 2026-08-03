@@ -1,5 +1,5 @@
 [workspace]
-members = ["btree"]
+members = ["btree", "spinlock"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,7 @@ authors = ["Akash Kumar Sinha"]
 
 [workspace.dependencies]
 btree = { path = "btree" }
+spinlock = { path = "spinlock" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 

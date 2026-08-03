@@ -1,10 +1,11 @@
 use crate::{
     Value,
-    pager::{PageId, Pager},
     error::ValueError,
+    pager::{PageId, Pager},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::marker::PhantomData;
+use spinlock::SpinLock;
+use std::{marker::PhantomData, sync::Arc};
 
 const MIN_DEGREE: usize = 5;
 const MAX_KEYS: usize = 2 * MIN_DEGREE - 1;
@@ -15,9 +16,13 @@ pub struct Initialized;
 pub struct Locked;
 pub struct Unlocked;
 
-pub struct BTree<S, State = Uninitialized, LockState = Locked> {
+pub struct PagerState {
     pager: Pager,
     root_id: PageId,
+}
+
+pub struct BTree<S, State = Uninitialized, LockState = Locked> {
+    pager_state: Arc<SpinLock<PagerState>>,
     state: PhantomData<State>,
     lock_state: PhantomData<LockState>,
     _marker: PhantomData<S>,
@@ -52,16 +57,38 @@ where
     }
 }
 
+impl<S, State, LockState> Clone for BTree<S, State, LockState>
+where
+    S: Ord + Clone + Serialize + DeserializeOwned,
+{
+    fn clone(&self) -> Self {
+        BTree {
+            pager_state: Arc::clone(&self.pager_state),
+            state: PhantomData,
+            lock_state: PhantomData,
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<S> BTree<S, Uninitialized, Locked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
 {
     pub fn new(path: &str) -> BTree<S, Initialized, Locked> {
-        let mut pager = Pager::open(path).expect("open failed");
-        let root_id = Node::<S>::new_leaf(&mut pager);
+        let pager_state = Arc::new(SpinLock::new(PagerState {
+            pager: Pager::open(path).expect("open failed"),
+            root_id: 0,
+        }));
+
+        {
+            let mut guard = pager_state.acquire();
+            let root_id = Node::<S>::new_leaf(&mut guard.pager);
+            guard.root_id = root_id;
+        }
+
         BTree {
-            pager,
-            root_id,
+            pager_state,
             state: PhantomData,
             lock_state: PhantomData,
             _marker: PhantomData,
@@ -75,8 +102,7 @@ where
 {
     pub fn unlock(self) -> BTree<S, Initialized, Unlocked> {
         BTree {
-            pager: self.pager,
-            root_id: self.root_id,
+            pager_state: self.pager_state,
             state: PhantomData,
             lock_state: PhantomData,
             _marker: PhantomData,
@@ -134,8 +160,9 @@ where
 
     pub fn range(&mut self) -> Vec<(S, Value)> {
         let mut result = Vec::new();
-        let root_id = self.root_id;
-        Self::range_node(&mut self.pager, root_id, &mut result);
+        let mut guard = self.pager_state.acquire();
+        let root_id = guard.root_id;
+        Self::range_node(&mut guard.pager, root_id, &mut result);
         result
     }
 
@@ -143,13 +170,15 @@ where
     where
         R: TryFrom<Value, Error = ValueError>,
     {
-        let root_id = self.root_id;
-        Self::search_node(&mut self.pager, root_id, key)
+        let mut guard = self.pager_state.acquire();
+        let root_id = guard.root_id;
+        Self::search_node(&mut guard.pager, root_id, key)
     }
 
     pub fn len(&mut self) -> usize {
-        let root_id = self.root_id;
-        Self::find_len(&mut self.pager, root_id)
+        let mut guard = self.pager_state.acquire();
+        let root_id = guard.root_id;
+        Self::find_len(&mut guard.pager, root_id)
     }
 }
 
@@ -158,8 +187,10 @@ where
     S: Ord + Clone + Serialize + DeserializeOwned,
 {
     fn insert(&mut self, key: S, value: Value) {
+        let mut guard = self.pager_state.acquire();
+        let root_id = guard.root_id;
         let root_is_full: bool = {
-            let node: Node<S> = self.pager.read_page(self.root_id).expect("read failed");
+            let node: Node<S> = guard.pager.read_page(root_id).expect("read failed");
             node.is_full()
         };
 
@@ -167,20 +198,21 @@ where
             let new_root_node: Node<S> = Node {
                 keys: Vec::new(),
                 values: Vec::new(),
-                children: vec![self.root_id],
+                children: vec![root_id],
                 is_leaf: false,
             };
-            let new_root_id = self.pager.allocate_page();
-            self.pager
+            let new_root_id = guard.pager.allocate_page();
+            guard
+                .pager
                 .write_page(new_root_id, &new_root_node)
                 .expect("write failed");
 
-            Self::split_child(&mut self.pager, new_root_id, 0);
-            self.root_id = new_root_id;
+            Self::split_child(&mut guard.pager, new_root_id, 0);
+            guard.root_id = new_root_id;
         }
 
-        let root_id = self.root_id;
-        Self::insert_non_full(&mut self.pager, root_id, key, value);
+        let root_id = guard.root_id;
+        Self::insert_non_full(&mut guard.pager, root_id, key, value);
     }
 
     fn split_child(pager: &mut Pager, parent_id: PageId, i: usize) {
@@ -461,8 +493,7 @@ where
 
     pub fn lock(self) -> BTree<S, Initialized, Locked> {
         BTree {
-            pager: self.pager,
-            root_id: self.root_id,
+            pager_state: self.pager_state,
             state: PhantomData,
             lock_state: PhantomData,
             _marker: PhantomData,
@@ -474,11 +505,13 @@ where
     }
 
     pub fn delete(&mut self, key: S) -> (bool, Option<Value>) {
-        let result = Self::delete_node(&mut self.pager, self.root_id, key);
+        let mut guard = self.pager_state.acquire();
+        let root_id = guard.root_id;
+        let result = Self::delete_node(&mut guard.pager, root_id, key);
 
-        let root: Node<S> = self.pager.read_page(self.root_id).expect("read failed");
+        let root: Node<S> = guard.pager.read_page(root_id).expect("read failed");
         if !root.is_leaf && root.keys.is_empty() {
-            self.root_id = root.children[0];
+            guard.root_id = root.children[0];
         }
 
         result

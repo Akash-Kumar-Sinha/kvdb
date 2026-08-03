@@ -65,9 +65,21 @@ where
     }
 }
 
+impl<S, LockState> Clone for KvDb<S, LockState>
+where
+    S: Ord + Clone + Serialize + DeserializeOwned,
+{
+    fn clone(&self) -> Self {
+        KvDb {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     fn fresh_path(path: &str) {
         std::fs::remove_file(path).ok();
@@ -335,6 +347,35 @@ mod tests {
         db.put(1, (left.clone(), right.clone()));
         let value: (Vec<Value>, Vec<Value>) = db.get(&1).expect("get failed");
         assert_eq!(value, (left, right));
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_concurrent_reads_single_writer() {
+        let path = "/tmp/test_kvdb_concurrent.db";
+        fresh_path(path);
+
+        let mut db = KvDb::<i32>::open(path);
+        for i in 1..=8 {
+            db.put(i, i * 10);
+        }
+
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let mut db = db.clone();
+                thread::spawn(move || {
+                    for i in 1..=8 {
+                        let value: i32 = db.get(&i).expect("get failed");
+                        assert_eq!(value, i * 10, "thread {t}: get({i}) mismatch");
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
         fresh_path(path);
     }
 }
