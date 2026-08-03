@@ -13,6 +13,7 @@ pub enum Value {
     UInt8(u8),
     F64(f64),
     F32(f32),
+    Char(char),
     Text(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
@@ -66,6 +67,11 @@ impl From<f32> for Value {
     }
 }
 
+impl From<char> for Value {
+    fn from(value: char) -> Self {
+        Value::Char(value)
+    }
+}
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
@@ -184,6 +190,15 @@ impl TryFrom<Value> for f32 {
     }
 }
 
+impl TryFrom<Value> for char {
+    type Error = ValueError;
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Char(v) => Ok(v),
+            _ => Err(ValueError::TypeMismatch),
+        }
+    }
+}
 
 impl TryFrom<Value> for String {
     type Error = ValueError;

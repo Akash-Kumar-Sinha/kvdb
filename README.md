@@ -68,6 +68,7 @@ pub enum Value {
     UInt8(u8),
     F64(f64),
     F32(f32),
+    Char(char),
     Text(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
