@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_kvdb_lock_unlock_round_trip() {
-        let path = "/tmp/test_kvdb_lock.db";
+        let path = "/tmp/test_kvdb.db";
         fresh_path(path);
 
         let mut db = KvDb::<i32>::open(path);
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_kvdb_string_keys_and_values() {
-        let path = "/tmp/test_kvdb_strings.db";
+        let path = "/tmp/test_kvdb.db";
         fresh_path(path);
 
         let mut db = KvDb::<String>::open(path);
@@ -189,6 +189,152 @@ mod tests {
         ];
         assert_eq!(range, expected);
 
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_i8_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 5i8);
+        let value: i8 = db.get(&1).expect("get failed");
+        assert_eq!(value, 5);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_i32_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 42i32);
+        let value: i32 = db.get(&1).expect("get failed");
+        assert_eq!(value, 42);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_i64_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 9_000_000_000i64);
+        let value: i64 = db.get(&1).expect("get failed");
+        assert_eq!(value, 9_000_000_000);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_u8_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 200u8);
+        let value: u8 = db.get(&1).expect("get failed");
+        assert_eq!(value, 200);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_u32_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 4_000_000_000u32);
+        let value: u32 = db.get(&1).expect("get failed");
+        assert_eq!(value, 4_000_000_000);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_u64_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 18_000_000_000_000_000_000u64);
+        let value: u64 = db.get(&1).expect("get failed");
+        assert_eq!(value, 18_000_000_000_000_000_000);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_f32_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 3.5f32);
+        let value: f32 = db.get(&1).expect("get failed");
+        assert_eq!(value, 3.5);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_f64_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 3.14159265358979f64);
+        let value: f64 = db.get(&1).expect("get failed");
+        assert_eq!(value, 3.14159265358979);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_char_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, 'R');
+        let value: char = db.get(&1).expect("get failed");
+        assert_eq!(value, 'R');
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_text_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, "hello world".to_string());
+        let value: String = db.get(&1).expect("get failed");
+        assert_eq!(value, "hello world");
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_bytes_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        db.put(1, vec![1u8, 2, 3, 4, 5]);
+        let value: Vec<u8> = db.get(&1).expect("get failed");
+        assert_eq!(value, vec![1, 2, 3, 4, 5]);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_list_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        let list = Value::List(vec![Value::I32(1), Value::I32(2), Value::I32(3)]);
+        db.put(1, list);
+        let value: Vec<Value> = db.get(&1).expect("get failed");
+        assert_eq!(value, vec![Value::I32(1), Value::I32(2), Value::I32(3)]);
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_pair_value() {
+        let path = "/tmp/test_kvdb.db";
+        fresh_path(path);
+        let mut db = KvDb::<i32>::open(path);
+        let left = vec![Value::I32(1), Value::I32(2)];
+        let right = vec![Value::Text("a".to_string()), Value::Text("b".to_string())];
+        db.put(1, (left.clone(), right.clone()));
+        let value: (Vec<Value>, Vec<Value>) = db.get(&1).expect("get failed");
+        assert_eq!(value, (left, right));
         fresh_path(path);
     }
 }

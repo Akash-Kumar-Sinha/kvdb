@@ -17,6 +17,7 @@ pub enum Value {
     Text(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
+    Pair(Vec<Value>, Vec<Value>),
 }
 
 impl From<i64> for Value {
@@ -97,6 +98,12 @@ impl From<Vec<Value>> for Value {
     }
 }
 
+impl From<(Vec<Value>, Vec<Value>)> for Value {
+    fn from(value: (Vec<Value>, Vec<Value>)) -> Self {
+        Value::Pair(value.0, value.1)
+    }
+}
+
 impl TryFrom<Value> for i64 {
     type Error = ValueError;
     fn try_from(value: Value) -> Result<Self, Self::Error> {
@@ -169,7 +176,6 @@ impl TryFrom<Value> for u8 {
     }
 }
 
-
 impl TryFrom<Value> for f64 {
     type Error = ValueError;
     fn try_from(value: Value) -> Result<Self, Self::Error> {
@@ -225,6 +231,16 @@ impl TryFrom<Value> for Vec<Value> {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::List(v) => Ok(v),
+            _ => Err(ValueError::TypeMismatch),
+        }
+    }
+}
+
+impl TryFrom<Value> for (Vec<Value>, Vec<Value>) {
+    type Error = ValueError;
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Pair(v1, v2) => Ok((v1, v2)),
             _ => Err(ValueError::TypeMismatch),
         }
     }
