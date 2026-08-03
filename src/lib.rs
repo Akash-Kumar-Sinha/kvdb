@@ -1,3 +1,3 @@
-mod btree;
-mod kvdb;
-mod pager;
+pub mod kvdb;
+
+pub use kvdb::KvDb;

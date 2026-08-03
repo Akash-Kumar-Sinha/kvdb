@@ -1,0 +1,9 @@
+[package]
+name = "btree"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+bincode.workspace = true

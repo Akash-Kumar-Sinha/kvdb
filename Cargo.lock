@@ -12,10 +12,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "kvdb"
+name = "btree"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "serde",
+]
+
+[[package]]
+name = "kvdb"
+version = "0.1.0"
+dependencies = [
+ "btree",
  "serde",
 ]
 

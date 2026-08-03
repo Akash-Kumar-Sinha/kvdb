@@ -1,4 +1,4 @@
-use crate::btree::{BTree, Initialized, Locked, Uninitialized, Unlocked};
+use btree::{BTree, Initialized, Locked, Uninitialized, Unlocked};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub struct KvDb<S, T, LockState = Unlocked>
