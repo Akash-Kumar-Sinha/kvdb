@@ -1,4 +1,8 @@
-use crate::pager::{PageId, Pager};
+use crate::{
+    Value,
+    pager::{PageId, Pager},
+    error::ValueError,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 
@@ -11,29 +15,28 @@ pub struct Initialized;
 pub struct Locked;
 pub struct Unlocked;
 
-pub struct BTree<S, T, State = Uninitialized, LockState = Locked> {
+pub struct BTree<S, State = Uninitialized, LockState = Locked> {
     pager: Pager,
     root_id: PageId,
     state: PhantomData<State>,
     lock_state: PhantomData<LockState>,
-    _marker: PhantomData<(S, T)>,
+    _marker: PhantomData<S>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Node<S, T> {
+pub struct Node<S> {
     pub keys: Vec<S>,
-    pub values: Vec<T>,
+    pub values: Vec<Value>,
     pub children: Vec<PageId>,
     pub is_leaf: bool,
 }
 
-impl<S, T> Node<S, T>
+impl<S> Node<S>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
     fn new_leaf(pager: &mut Pager) -> PageId {
-        let node: Node<S, T> = Node {
+        let node: Node<S> = Node {
             keys: Vec::new(),
             values: Vec::new(),
             children: Vec::new(),
@@ -49,14 +52,13 @@ where
     }
 }
 
-impl<S, T> BTree<S, T, Uninitialized, Locked>
+impl<S> BTree<S, Uninitialized, Locked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
-    pub fn new(path: &str) -> BTree<S, T, Initialized, Locked> {
+    pub fn new(path: &str) -> BTree<S, Initialized, Locked> {
         let mut pager = Pager::open(path).expect("open failed");
-        let root_id = Node::<S, T>::new_leaf(&mut pager);
+        let root_id = Node::<S>::new_leaf(&mut pager);
         BTree {
             pager,
             root_id,
@@ -67,12 +69,11 @@ where
     }
 }
 
-impl<S, T> BTree<S, T, Initialized, Locked>
+impl<S> BTree<S, Initialized, Locked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
-    pub fn unlock(self) -> BTree<S, T, Initialized, Unlocked> {
+    pub fn unlock(self) -> BTree<S, Initialized, Unlocked> {
         BTree {
             pager: self.pager,
             root_id: self.root_id,
@@ -83,30 +84,32 @@ where
     }
 }
 
-impl<S, T, LockState> BTree<S, T, Initialized, LockState>
+impl<S, LockState> BTree<S, Initialized, LockState>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
-    fn search_node(pager: &mut Pager, id: PageId, key: &S) -> Option<T> {
-        let node: Node<S, T> = pager.read_page(id).expect("read failed");
+    fn search_node<R>(pager: &mut Pager, id: PageId, key: &S) -> Result<R, ValueError>
+    where
+        R: TryFrom<Value, Error = ValueError>,
+    {
+        let node: Node<S> = pager.read_page(id).expect("read failed");
 
         let mut i = 0;
         while i < node.keys.len() && key > &node.keys[i] {
             i += 1;
         }
         if i < node.keys.len() && key == &node.keys[i] {
-            return Some(node.values[i].clone());
+            return R::try_from(node.values[i].clone());
         }
         if node.is_leaf {
-            return None;
+            return Err(ValueError::NotFound);
         }
         let child_id = node.children[i];
         Self::search_node(pager, child_id, key)
     }
 
-    fn range_node(pager: &mut Pager, id: PageId, result: &mut Vec<(S, T)>) {
-        let node: Node<S, T> = pager.read_page(id).expect("read failed");
+    fn range_node(pager: &mut Pager, id: PageId, result: &mut Vec<(S, Value)>) {
+        let node: Node<S> = pager.read_page(id).expect("read failed");
 
         for i in 0..node.keys.len() {
             if !node.is_leaf {
@@ -121,7 +124,7 @@ where
     }
 
     fn find_len(pager: &mut Pager, id: PageId) -> usize {
-        let node: Node<S, T> = pager.read_page(id).expect("read failed");
+        let node: Node<S> = pager.read_page(id).expect("read failed");
         let mut total = node.keys.len();
         for &child_id in &node.children {
             total += Self::find_len(pager, child_id);
@@ -129,14 +132,17 @@ where
         total
     }
 
-    pub fn range(&mut self) -> Vec<(S, T)> {
+    pub fn range(&mut self) -> Vec<(S, Value)> {
         let mut result = Vec::new();
         let root_id = self.root_id;
         Self::range_node(&mut self.pager, root_id, &mut result);
         result
     }
 
-    pub fn get(&mut self, key: &S) -> Option<T> {
+    pub fn get<R>(&mut self, key: &S) -> Result<R, ValueError>
+    where
+        R: TryFrom<Value, Error = ValueError>,
+    {
         let root_id = self.root_id;
         Self::search_node(&mut self.pager, root_id, key)
     }
@@ -147,19 +153,18 @@ where
     }
 }
 
-impl<S, T> BTree<S, T, Initialized, Unlocked>
+impl<S> BTree<S, Initialized, Unlocked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
-    fn insert(&mut self, key: S, value: T) {
+    fn insert(&mut self, key: S, value: Value) {
         let root_is_full: bool = {
-            let node: Node<S, T> = self.pager.read_page(self.root_id).expect("read failed");
+            let node: Node<S> = self.pager.read_page(self.root_id).expect("read failed");
             node.is_full()
         };
 
         if root_is_full {
-            let new_root_node: Node<S, T> = Node {
+            let new_root_node: Node<S> = Node {
                 keys: Vec::new(),
                 values: Vec::new(),
                 children: vec![self.root_id],
@@ -180,9 +185,9 @@ where
 
     fn split_child(pager: &mut Pager, parent_id: PageId, i: usize) {
         let mid = MIN_DEGREE - 1;
-        let mut parent: Node<S, T> = pager.read_page(parent_id).expect("read failed");
+        let mut parent: Node<S> = pager.read_page(parent_id).expect("read failed");
         let child_id = parent.children[i];
-        let mut child: Node<S, T> = pager.read_page(child_id).expect("read failed");
+        let mut child: Node<S> = pager.read_page(child_id).expect("read failed");
 
         let mid_key = child.keys[mid].clone();
         let mid_val = child.values[mid].clone();
@@ -216,8 +221,8 @@ where
         pager.write_page(parent_id, &parent).expect("write failed");
     }
 
-    fn insert_non_full(pager: &mut Pager, id: PageId, key: S, value: T) {
-        let mut node: Node<S, T> = pager.read_page(id).expect("read failed");
+    fn insert_non_full(pager: &mut Pager, id: PageId, key: S, value: Value) {
+        let mut node: Node<S> = pager.read_page(id).expect("read failed");
 
         if node.is_leaf {
             let mut i = node.keys.len();
@@ -237,7 +242,7 @@ where
 
         let child_id = node.children[i];
         let child_full = {
-            let child: Node<S, T> = pager.read_page(child_id).expect("read failed");
+            let child: Node<S> = pager.read_page(child_id).expect("read failed");
             child.is_full()
         };
 
@@ -253,8 +258,8 @@ where
         Self::insert_non_full(pager, child_id, key, value);
     }
 
-    fn delete_node(pager: &mut Pager, id: PageId, key: S) -> (bool, Option<T>) {
-        let mut node: Node<S, T> = pager.read_page(id).expect("read failed");
+    fn delete_node(pager: &mut Pager, id: PageId, key: S) -> (bool, Option<Value>) {
+        let mut node: Node<S> = pager.read_page(id).expect("read failed");
 
         let mut i = 0;
         while i < node.keys.len() && key > node.keys[i] {
@@ -272,12 +277,12 @@ where
             let left_id = node.children[i];
             let right_id = node.children[i + 1];
             let left_len = pager
-                .read_page::<S, T>(left_id)
+                .read_page::<S>(left_id)
                 .expect("read failed")
                 .keys
                 .len();
             let right_len = pager
-                .read_page::<S, T>(right_id)
+                .read_page::<S>(right_id)
                 .expect("read failed")
                 .keys
                 .len();
@@ -312,9 +317,9 @@ where
         Self::delete_node(pager, child_id, key)
     }
 
-    fn get_predecessor(pager: &mut Pager, mut id: PageId) -> (S, T) {
+    fn get_predecessor(pager: &mut Pager, mut id: PageId) -> (S, Value) {
         loop {
-            let node: Node<S, T> = pager.read_page(id).expect("read failed");
+            let node: Node<S> = pager.read_page(id).expect("read failed");
             if node.is_leaf {
                 let last = node.keys.len() - 1;
                 return (node.keys[last].clone(), node.values[last].clone());
@@ -323,9 +328,9 @@ where
         }
     }
 
-    fn get_successor(pager: &mut Pager, mut id: PageId) -> (S, T) {
+    fn get_successor(pager: &mut Pager, mut id: PageId) -> (S, Value) {
         loop {
-            let node: Node<S, T> = pager.read_page(id).expect("read failed");
+            let node: Node<S> = pager.read_page(id).expect("read failed");
             if node.is_leaf {
                 return (node.keys[0].clone(), node.values[0].clone());
             }
@@ -334,10 +339,10 @@ where
     }
 
     fn fill_child(pager: &mut Pager, parent_id: PageId, idx: usize) -> PageId {
-        let parent: Node<S, T> = pager.read_page(parent_id).expect("read failed");
+        let parent: Node<S> = pager.read_page(parent_id).expect("read failed");
         let child_id = parent.children[idx];
         let child_len = pager
-            .read_page::<S, T>(child_id)
+            .read_page::<S>(child_id)
             .expect("read failed")
             .keys
             .len();
@@ -350,7 +355,7 @@ where
         let left_has_spare = idx > 0 && {
             let left_id = parent.children[idx - 1];
             pager
-                .read_page::<S, T>(left_id)
+                .read_page::<S>(left_id)
                 .expect("read failed")
                 .keys
                 .len()
@@ -364,7 +369,7 @@ where
         let right_has_spare = idx < n - 1 && {
             let right_id = parent.children[idx + 1];
             pager
-                .read_page::<S, T>(right_id)
+                .read_page::<S>(right_id)
                 .expect("read failed")
                 .keys
                 .len()
@@ -386,11 +391,11 @@ where
     }
 
     fn borrow_from_prev(pager: &mut Pager, parent_id: PageId, idx: usize) {
-        let mut parent: Node<S, T> = pager.read_page(parent_id).expect("read failed");
+        let mut parent: Node<S> = pager.read_page(parent_id).expect("read failed");
         let child_id = parent.children[idx];
         let left_id = parent.children[idx - 1];
-        let mut child: Node<S, T> = pager.read_page(child_id).expect("read failed");
-        let mut left: Node<S, T> = pager.read_page(left_id).expect("read failed");
+        let mut child: Node<S> = pager.read_page(child_id).expect("read failed");
+        let mut left: Node<S> = pager.read_page(left_id).expect("read failed");
 
         child.keys.insert(0, parent.keys[idx - 1].clone());
         child.values.insert(0, parent.values[idx - 1].clone());
@@ -410,11 +415,11 @@ where
     }
 
     fn borrow_from_next(pager: &mut Pager, parent_id: PageId, idx: usize) {
-        let mut parent: Node<S, T> = pager.read_page(parent_id).expect("read failed");
+        let mut parent: Node<S> = pager.read_page(parent_id).expect("read failed");
         let child_id = parent.children[idx];
         let right_id = parent.children[idx + 1];
-        let mut child: Node<S, T> = pager.read_page(child_id).expect("read failed");
-        let mut right: Node<S, T> = pager.read_page(right_id).expect("read failed");
+        let mut child: Node<S> = pager.read_page(child_id).expect("read failed");
+        let mut right: Node<S> = pager.read_page(right_id).expect("read failed");
 
         child.keys.push(parent.keys[idx].clone());
         child.values.push(parent.values[idx].clone());
@@ -434,11 +439,11 @@ where
     }
 
     fn merge_children(pager: &mut Pager, parent_id: PageId, idx: usize) {
-        let mut parent: Node<S, T> = pager.read_page(parent_id).expect("read failed");
+        let mut parent: Node<S> = pager.read_page(parent_id).expect("read failed");
         let left_id = parent.children[idx];
         let right_id = parent.children[idx + 1];
-        let mut left: Node<S, T> = pager.read_page(left_id).expect("read failed");
-        let right: Node<S, T> = pager.read_page(right_id).expect("read failed");
+        let mut left: Node<S> = pager.read_page(left_id).expect("read failed");
+        let right: Node<S> = pager.read_page(right_id).expect("read failed");
 
         let mid_key = parent.keys.remove(idx);
         let mid_val = parent.values.remove(idx);
@@ -454,7 +459,7 @@ where
         pager.write_page(parent_id, &parent).expect("write failed");
     }
 
-    pub fn lock(self) -> BTree<S, T, Initialized, Locked> {
+    pub fn lock(self) -> BTree<S, Initialized, Locked> {
         BTree {
             pager: self.pager,
             root_id: self.root_id,
@@ -464,14 +469,14 @@ where
         }
     }
 
-    pub fn put(&mut self, key: S, value: T) {
-        self.insert(key, value);
+    pub fn put(&mut self, key: S, value: impl Into<Value>) {
+        self.insert(key, value.into());
     }
 
-    pub fn delete(&mut self, key: S) -> (bool, Option<T>) {
+    pub fn delete(&mut self, key: S) -> (bool, Option<Value>) {
         let result = Self::delete_node(&mut self.pager, self.root_id, key);
 
-        let root: Node<S, T> = self.pager.read_page(self.root_id).expect("read failed");
+        let root: Node<S> = self.pager.read_page(self.root_id).expect("read failed");
         if !root.is_leaf && root.keys.is_empty() {
             self.root_id = root.children[0];
         }
@@ -494,8 +499,7 @@ mod tests {
     #[test]
     fn test_insertion_structure() {
         let path = "/tmp/test_btree.db";
-
-        let tree = BTree::<i32, i32, Uninitialized, Locked>::new(path);
+        let tree = BTree::<i64, Uninitialized, Locked>::new(path);
         let mut tree = tree.unlock();
 
         for i in 1..=12 {
@@ -503,14 +507,23 @@ mod tests {
         }
 
         for i in 1..=12 {
-            assert_eq!(tree.get(&i), Some(i * 10), "get({i}) mismatch");
+            let value: i64 = tree.get(&i).expect("get failed");
+            assert_eq!(value, i * 10, "get({i}) mismatch");
         }
-        assert_eq!(tree.get(&999), None, "missing key should return None");
+
+        assert!(
+            matches!(tree.get::<i64>(&999), Err(ValueError::NotFound)),
+            "missing key should return NotFound"
+        );
 
         let range = tree.range();
-        let expected: Vec<(i32, i32)> = (1..=12).map(|i| (i, i * 10)).collect();
+        let range_i64: Vec<(i64, i64)> = range
+            .into_iter()
+            .map(|(k, v)| (k, i64::try_from(v).expect("expected int")))
+            .collect();
+        let expected: Vec<(i64, i64)> = (1..=12).map(|i| (i, i * 10)).collect();
         assert_eq!(
-            range, expected,
+            range_i64, expected,
             "range() must return sorted (key, value) pairs"
         );
 
@@ -518,13 +531,18 @@ mod tests {
 
         let (found, value) = tree.delete(12);
         assert!(found, "delete(12) should report found = true");
-        assert_eq!(value, Some(120));
-        assert_eq!(tree.get(&12), None, "12 should be gone after delete");
+        let value = i64::try_from(value.expect("value missing")).expect("expected int");
+        assert_eq!(value, 120);
+
+        assert!(
+            matches!(tree.get::<i64>(&12), Err(ValueError::NotFound)),
+            "12 should be gone after delete"
+        );
         assert_eq!(tree.len(), 11);
 
         let (found, value) = tree.delete(999);
         assert!(!found, "deleting a missing key should report found = false");
-        assert_eq!(value, None);
+        assert!(value.is_none());
         assert_eq!(
             tree.len(),
             11,
@@ -533,12 +551,18 @@ mod tests {
 
         let (found, value) = tree.delete(5);
         assert!(found);
-        assert_eq!(value, Some(50));
-        assert_eq!(tree.get(&5), None);
+        let value: i64 = value
+            .expect("value missing")
+            .try_into()
+            .expect("expected int");
+        assert_eq!(value, 50);
+
+        assert!(matches!(tree.get::<i64>(&5), Err(ValueError::NotFound)));
         assert_eq!(tree.len(), 10);
 
         let mut tree = tree.lock();
-        assert_eq!(tree.get(&1), Some(10));
+        let value: i64 = tree.get(&1).expect("get failed");
+        assert_eq!(value, 10);
 
         std::fs::remove_file(path).ok();
     }

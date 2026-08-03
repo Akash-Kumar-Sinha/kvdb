@@ -1,63 +1,62 @@
-use btree::{BTree, Initialized, Locked, Uninitialized, Unlocked};
+use btree::{BTree, Initialized, Locked, Uninitialized, Unlocked, Value, ValueError};
 use serde::{Serialize, de::DeserializeOwned};
 
-pub struct KvDb<S, T, LockState = Unlocked>
+pub struct KvDb<S, LockState = Unlocked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
-    inner: BTree<S, T, Initialized, LockState>,
+    inner: BTree<S, Initialized, LockState>,
 }
 
-impl<S, T> KvDb<S, T, Unlocked>
+impl<S> KvDb<S, Unlocked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
     pub fn open(path: &str) -> Self {
-        let tree = BTree::<S, T, Uninitialized, Locked>::new(path);
+        let tree = BTree::<S, Uninitialized, Locked>::new(path);
         KvDb {
             inner: tree.unlock(),
         }
     }
 
-    pub fn put(&mut self, key: S, value: T) {
+    pub fn put(&mut self, key: S, value: impl Into<btree::Value>) {
         self.inner.put(key, value);
     }
 
-    pub fn delete(&mut self, key: S) -> (bool, Option<T>) {
+    pub fn delete(&mut self, key: S) -> (bool, Option<Value>) {
         self.inner.delete(key)
     }
 
-    pub fn lock(self) -> KvDb<S, T, Locked> {
+    pub fn lock(self) -> KvDb<S, Locked> {
         KvDb {
             inner: self.inner.lock(),
         }
     }
 }
 
-impl<S, T> KvDb<S, T, Locked>
+impl<S> KvDb<S, Locked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
-    pub fn unlock(self) -> KvDb<S, T, Unlocked> {
+    pub fn unlock(self) -> KvDb<S, Unlocked> {
         KvDb {
             inner: self.inner.unlock(),
         }
     }
 }
 
-impl<S, T, LockState> KvDb<S, T, LockState>
+impl<S, LockState> KvDb<S, LockState>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
-    T: Clone + Serialize + DeserializeOwned,
 {
-    pub fn get(&mut self, key: &S) -> Option<T> {
+    pub fn get<R>(&mut self, key: &S) -> Result<R, ValueError>
+    where
+        R: TryFrom<Value, Error = ValueError>,
+    {
         self.inner.get(key)
     }
 
-    pub fn range(&mut self) -> Vec<(S, T)> {
+    pub fn range(&mut self) -> Vec<(S, Value)> {
         self.inner.range()
     }
 
@@ -79,19 +78,24 @@ mod tests {
         let path = "/tmp/test_kvdb.db";
         fresh_path(path);
 
-        let mut db = KvDb::<i32, i32>::open(path);
+        let mut db = KvDb::<i32>::open(path);
 
         for i in 1..=12 {
             db.put(i, i * 10);
         }
 
         for i in 1..=12 {
-            assert_eq!(db.get(&i), Some(i * 10), "get({i}) mismatch");
+            let value: i32 = db.get(&i).expect("get failed");
+            assert_eq!(value, i * 10, "get({i}) mismatch");
         }
-        assert_eq!(db.get(&999), None, "missing key should return None");
+
+        assert!(
+            matches!(db.get::<i32>(&999), Err(ValueError::NotFound)),
+            "missing key should return NotFound"
+        );
 
         let range = db.range();
-        let expected: Vec<(i32, i32)> = (1..=12).map(|i| (i, i * 10)).collect();
+        let expected: Vec<(i32, Value)> = (1..=12).map(|i| (i, Value::I32(i * 10))).collect();
         assert_eq!(
             range, expected,
             "range() must return sorted (key, value) pairs"
@@ -101,8 +105,16 @@ mod tests {
 
         let (found, value) = db.delete(12);
         assert!(found, "delete(12) should report found = true");
-        assert_eq!(value, Some(120));
-        assert_eq!(db.get(&12), None);
+        let value: i32 = value
+            .expect("value missing")
+            .try_into()
+            .expect("expected int");
+        assert_eq!(value, 120);
+
+        assert!(
+            matches!(db.get::<i32>(&12), Err(ValueError::NotFound)),
+            "12 should be gone after delete"
+        );
         assert_eq!(db.len(), 11);
 
         let (found, value) = db.delete(999);
@@ -112,8 +124,13 @@ mod tests {
 
         let (found, value) = db.delete(5);
         assert!(found);
-        assert_eq!(value, Some(50));
-        assert_eq!(db.get(&5), None);
+        let value: i32 = value
+            .expect("value missing")
+            .try_into()
+            .expect("expected int");
+        assert_eq!(value, 50);
+
+        assert!(matches!(db.get::<i32>(&5), Err(ValueError::NotFound)));
         assert_eq!(db.len(), 10);
 
         fresh_path(path);
@@ -124,15 +141,17 @@ mod tests {
         let path = "/tmp/test_kvdb_lock.db";
         fresh_path(path);
 
-        let mut db = KvDb::<i32, i32>::open(path);
+        let mut db = KvDb::<i32>::open(path);
         db.put(1, 100);
 
         let mut db = db.lock();
-        assert_eq!(db.get(&1), Some(100), "get must still work while locked");
+        let value: i32 = db.get(&1).expect("get must still work while locked");
+        assert_eq!(value, 100);
 
         let mut db = db.unlock();
         db.put(2, 200);
-        assert_eq!(db.get(&2), Some(200));
+        let value: i32 = db.get(&2).expect("get failed");
+        assert_eq!(value, 200);
 
         fresh_path(path);
     }
@@ -142,25 +161,33 @@ mod tests {
         let path = "/tmp/test_kvdb_strings.db";
         fresh_path(path);
 
-        let mut db = KvDb::<String, String>::open(path);
+        let mut db = KvDb::<String>::open(path);
 
         db.put("apple".to_string(), "fruit".to_string());
         db.put("carrot".to_string(), "vegetable".to_string());
         db.put("banana".to_string(), "fruit".to_string());
 
-        assert_eq!(db.get(&"apple".to_string()), Some("fruit".to_string()));
-        assert_eq!(db.get(&"banana".to_string()), Some("fruit".to_string()));
-        assert_eq!(db.get(&"kiwi".to_string()), None);
+        let value: String = db.get(&"apple".to_string()).expect("get failed");
+        assert_eq!(value, "fruit");
+
+        let value: String = db.get(&"banana".to_string()).expect("get failed");
+        assert_eq!(value, "fruit");
+
+        assert!(
+            matches!(
+                db.get::<String>(&"kiwi".to_string()),
+                Err(ValueError::NotFound)
+            ),
+            "missing key should return NotFound"
+        );
 
         let range = db.range();
-        assert_eq!(
-            range,
-            vec![
-                ("apple".to_string(), "fruit".to_string()),
-                ("banana".to_string(), "fruit".to_string()),
-                ("carrot".to_string(), "vegetable".to_string()),
-            ]
-        );
+        let expected: Vec<(String, Value)> = vec![
+            ("apple".to_string(), Value::Text("fruit".to_string())),
+            ("banana".to_string(), Value::Text("fruit".to_string())),
+            ("carrot".to_string(), Value::Text("vegetable".to_string())),
+        ];
+        assert_eq!(range, expected);
 
         fresh_path(path);
     }
