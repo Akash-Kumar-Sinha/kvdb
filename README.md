@@ -72,6 +72,7 @@ pub enum Value {
     Text(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
+    Pair(Vec<Value>, Vec<Value>),
 }
 ```
 
