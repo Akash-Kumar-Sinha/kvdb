@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use btree::{BTree, Initialized, Locked, Uninitialized, Unlocked, Value, ValueError};
+use scan::{Scan, ScanIter};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub struct KvDb<S, LockState = Unlocked>
@@ -63,6 +66,10 @@ where
     pub fn len(&mut self) -> usize {
         self.inner.len()
     }
+
+    pub fn scan(&mut self) -> ScanIter<S> {
+        self.inner.scan()
+    }
 }
 
 impl<S, LockState> Clone for KvDb<S, LockState>
@@ -76,9 +83,23 @@ where
     }
 }
 
+impl<S, LockState> Scan<S> for KvDb<S, LockState>
+where
+    S: Ord + Clone + Serialize + DeserializeOwned,
+{
+    fn scan(&self) -> ScanIter<S> {
+        let guard = self.inner.pager_state.acquire();
+        ScanIter {
+            pager_state: Arc::clone(&self.inner.pager_state),
+            stack: vec![(guard.root_id, 0)],
+            current: None,
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scan::LendingIterator;
     use std::thread;
 
     fn fresh_path(path: &str) {
@@ -375,6 +396,38 @@ mod tests {
         for h in handles {
             h.join().expect("thread panicked");
         }
+
+        fresh_path(path);
+    }
+
+    #[test]
+    fn test_kvdb_scan() {
+        let path = "/tmp/test_kvdb_scan.db";
+        fresh_path(path);
+
+        let mut db = KvDb::<i32>::open(path);
+        for i in 1..=8 {
+            db.put(i, i * 10);
+        }
+
+        let mut iter = db.scan();
+        let mut collected: Vec<(i32, i32)> = Vec::new();
+        while let Some((k, v)) = iter.next() {
+            let value: i32 = i32::try_from(v.clone()).expect("expected int");
+            collected.push((*k, value));
+        }
+        collected.sort_by_key(|(k, _)| *k);
+
+        let expected: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+        assert_eq!(
+            collected, expected,
+            "scan() must yield every inserted key/value"
+        );
+        assert_eq!(
+            collected.len(),
+            8,
+            "scan() must not skip or duplicate entries"
+        );
 
         fresh_path(path);
     }

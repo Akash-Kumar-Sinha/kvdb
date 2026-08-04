@@ -1,0 +1,10 @@
+[package]
+name = "scan"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+btree = { path = "../btree" }
+spinlock = { path = "../spinlock" }
+serde.workspace = true
