@@ -1,5 +1,5 @@
 [workspace]
-members = ["async_kvdb","btree",  "kvdb_rt", "scan", "spinlock"]
+members = ["async_kvdb", "btree", "codec", "kvdb_rt", "scan", "spinlock", "value"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,10 +8,13 @@ authors = ["Akash Kumar Sinha"]
 
 [workspace.dependencies]
 btree = { path = "btree" }
+codec = { path = "codec" }
 spinlock = { path = "spinlock" }
 scan = { path = "scan" }
 kvdb_rt = { path = "kvdb_rt" }
+value = { path = "value" }
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 bincode = "1"
 thiserror = "2"
 
@@ -23,5 +26,6 @@ authors.workspace = true
 
 [dependencies]
 btree.workspace = true
+codec.workspace = true
 scan.workspace = true
 serde.workspace = true
