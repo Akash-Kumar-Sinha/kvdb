@@ -1,0 +1,13 @@
+[package]
+name = "async_kvdb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+scan = { path = "../scan" }
+btree = { path = "../btree" }
+kvdb_rt = { path = "../kvdb_rt" }
+spinlock = { path = "../spinlock" }
+kvdb = { path = ".." }
+serde.workspace = true
