@@ -1,6 +1,6 @@
 # KvDB
 
-A disk-backed, embedded key-value store built from scratch in Rust — a B-tree storage engine with a page-based on-disk format, a compile-time-enforced typestate API, real thread-safe concurrency via a hand-rolled spinlock, and a zero-copy scanning API built on a hand-rolled `LendingIterator`.
+A disk-backed, embedded key-value store built from scratch in Rust — a B-tree storage engine with a page-based on-disk format, a compile-time-enforced typestate API, real thread-safe concurrency via a hand-rolled spinlock, a zero-copy scanning API built on a hand-rolled `LendingIterator`, and an optional async layer.
 
 ## Table of Contents
 
@@ -11,9 +11,22 @@ A disk-backed, embedded key-value store built from scratch in Rust — a B-tree 
   - [Page-based disk storage](#page-based-disk-storage)
   - [The typestate pattern](#the-typestate-pattern)
   - [Typed values via `Value`](#typed-values-via-value)
+  - [`put` vs. `update`: insert-only by default](#put-vs-update-insert-only-by-default)
   - [Real concurrency via a hand-rolled spinlock](#real-concurrency-via-a-hand-rolled-spinlock)
   - [Zero-copy scanning via `LendingIterator`](#zero-copy-scanning-via-lendingiterator)
-- [How to Use](#how-to-use)
+  - [Async access via a hand-rolled `Future`](#async-access-via-a-hand-rolled-future)
+- [`KvDb` — the synchronous API](#kvdb--the-synchronous-api)
+  - [Constructing](#constructing)
+  - [Writing](#writing)
+  - [Reading](#reading)
+  - [Iterating](#iterating)
+  - [Lock state transitions](#lock-state-transitions)
+- [`AsyncKvDb` — the async API](#asynckvdb--the-async-api)
+  - [Constructing an async handle](#constructing-an-async-handle)
+  - [Awaiting operations](#awaiting-operations)
+  - [Async iteration](#async-iteration)
+  - [How it differs from `KvDb`](#how-it-differs-from-kvdb)
+- [Values and conversions](#values-and-conversions)
 - [Workspace Layout](#workspace-layout)
 - [Current Limitations](#current-limitations)
 
@@ -21,7 +34,14 @@ A disk-backed, embedded key-value store built from scratch in Rust — a B-tree 
 
 KvDB is an embedded key-value store — not a server you connect to over a socket, but a library you link directly into your program, the same relationship SQLite or `sled` have to the process using them. Keys are generic (`S`), values are stored as a typed `Value` enum, and everything is read/written a fixed-size page at a time through a custom `Pager`, safely shareable across threads via a hand-built spinlock.
 
-The public interface is `KvDb<S, LockState>` — `open` / `put` / `get` / `delete` / `range` / `scan` / `len`, with `lock()`/`unlock()` enforcing at compile time when mutation is allowed. It's built on top of `BTree` (in the `btree` crate), `SpinLock` (in the `spinlock` crate), and `LendingIterator`/`Scan` (in the `scan` crate), but those are internal building blocks — `KvDb` is the intended entry point.
+There are exactly two types you interact with:
+
+| Type | Crate | Use when |
+|------|-------|----------|
+| `KvDb<S, LockState>` | `kvdb` | Ordinary synchronous access. |
+| `AsyncKvDb<S, LockState>` | `async_kvdb` | You want DB calls to not block the calling thread. |
+
+Everything else — `BTree`, `SpinLock`, `Pager`, `Scan`, `KvdbCall` — is an internal building block. `kvdb` re-exports the handful of items you actually need (`KvDb`, `Value`, `ValueError`, `ScanIter`, `LendingIterator`), and internal types are either private or marked `#[doc(hidden)]`, so you never depend on the internal crates directly.
 
 ## Motivation
 
@@ -47,13 +67,239 @@ Every node lives at a fixed-size (4KB) slot in a single file, addressed by a `Pa
 `BTree<S, State, LockState>` uses two phantom-typed state parameters:
 
 - **`Uninitialized` / `Initialized`** — `get`/`put`/`delete`/`range` are only defined in an `impl` block scoped to `BTree<S, Initialized, _>`. Calling them on an uninitialized tree isn't a runtime error, a panic, or an `unwrap()` on `None` — it's a method that doesn't exist for that type, caught by the compiler at the call site.
-- **`Locked` / `Unlocked`** — mutating methods (`put`, `delete`) only exist on `BTree<S, Initialized, Unlocked>`; `unlock()`/`lock()` consume `self` and return a differently-typed tree, so the transition is enforced the same way — at compile time, not at runtime. The intent is safety-by-default: a handle you're only using to read shouldn't be _able_ to accidentally mutate — locking isn't something you opt into to protect data, it's the default you have to deliberately opt out of (`unlock()`) before mutation becomes possible at all.
+- **`Locked` / `Unlocked`** — mutating methods (`put`, `delete`) only exist on `BTree<S, Initialized, Unlocked>`; `unlock()`/`lock()` consume `self` and return a differently-typed tree, so the transition is enforced the same way — at compile time, not at runtime. The intent is safety-by-default: a handle you're only using to read shouldn't be _able_ to accidentally mutate.
 
-`KvDb<S, LockState>` forwards this exact same protocol rather than hiding it: `open()` returns an `Unlocked` `KvDb` by default (so ordinary usage — `open`, `put`, `get` — needs no ceremony at all), but `put`/`delete` are only defined for `KvDb<S, Unlocked>`, `get`/`range`/`scan`/`len` work in either state, and `lock()`/`unlock()` consume `self` and return a differently-typed `Self`.
+`KvDb<S, LockState>` forwards this exact same protocol rather than hiding it: `open()` returns an `Unlocked` `KvDb` by default (so ordinary usage needs no ceremony), `put`/`delete` are only defined for `KvDb<S, Unlocked>`, `get`/`range`/`scan`/`len` work in either state, and `lock()`/`unlock()` consume `self` and return a differently-typed `Self`.
 
 ### Typed values via `Value`
 
-Values are a closed, `#[non_exhaustive]` enum:
+Values are a closed, `#[non_exhaustive]` enum, so what's on disk is self-describing rather than an opaque blob. The public API hides the enum at both ends: `put` takes `impl Into<Value>` so `db.put(1, 100i64)` works without writing `Value::I64(100)`, and `get<R>` is generic over the return type so `let name: String = db.get(&key)?;` extracts and type-checks in one step. See [Values and conversions](#values-and-conversions) for the full type table and the exact-match rule.
+
+### `put` vs. `update`: insert-only by default
+
+`put` always inserts — calling it twice with the same key stores two entries, not one. That's a deliberate default, not an oversight: `put` only ever walks down to a leaf and appends, so it never pays the cost of checking whether the key already exists. Anything that already knows its keys are fresh (bulk loads, append-only logs) gets the cheapest possible write path.
+
+`update` is the separate, explicit opt-in for upsert semantics: it walks the tree once to check whether the key exists (recursing into children, not just the root), overwrites in place if so, and falls back to `put`'s insert path if not. Splitting these into two methods, rather than making `put` always check first, means the common "I know this key is new" case never pays for a lookup it doesn't need.
+
+### Real concurrency via a hand-rolled spinlock
+
+`Pager` and `root_id` live together in `PagerState`, wrapped in a `SpinLock<T>` (its own crate, `spinlock`) — `AtomicBool`-based, `compare_exchange` for acquire, a `store` for release, `UnsafeCell<T>` holding the guarded data, and an RAII guard whose `Drop` releases the lock automatically. `unsafe impl Send`/`Sync` is written and justified explicitly, not assumed.
+
+`BTree`/`KvDb` hold this behind an `Arc`, so multiple handles — potentially on different threads — can safely share the same underlying storage. Every public entry point acquires the lock exactly once per call and reads `root_id` fresh from the shared state rather than from a per-clone cached copy — an earlier version cached `root_id` on each clone independently, which could silently go stale after a concurrent split. A separate, earlier bug (fixed first): a version that acquired the lock once per internal helper function, rather than once per public call, deadlocked reliably on any operation that triggered a B-tree split, since a function would try to re-acquire a lock its own caller already held.
+
+### Zero-copy scanning via `LendingIterator`
+
+`range()` returns an owned `Vec<(S, Value)>` — simple, but every key and value gets cloned to build it, even if the caller only wants to iterate once and discard most of the data. `scan()` avoids that: it borrows each key/value directly out of whichever page is currently loaded.
+
+This can't be expressed with `std::iter::Iterator`, because that trait's `Item` type can't borrow from the iterator itself across calls to `next()` — the standard iterator protocol assumes each item is either owned or borrows from something living *outside* the iterator. `scan()`'s items borrow from the iterator's own internal page cache, which changes on every call. That requires a **lending iterator**, implemented here as a small hand-written trait using a Generic Associated Type:
+
+```rust
+pub trait LendingIterator {
+    type Item<'a> where Self: 'a;
+    fn next(&mut self) -> Option<Self::Item<'_>>;
+}
+```
+
+`ScanIter<S>` implements this with `type Item<'a> = (&'a S, &'a Value)`, walking the tree with an explicit stack (rather than recursion, since `next()` calls can't recurse across separate invocations) and interleaving "descend into child" with "yield this key" in in-order sequence. That traversal step lives in one shared function, so the sync and async walkers can't drift out of agreement about ordering.
+
+Because `LendingIterator` isn't `std::iter::Iterator`, `for` loops, `.map()`/`.filter()`/`.collect()` don't work on it directly — a `scan()` loop is written by hand with `while let Some((k, v)) = iter.next() { ... }`. That ergonomics cost is the deliberate tradeoff for the zero-copy guarantee; `range()` stays available for callers who'd rather pay for the clones and get a plain `Vec` back.
+
+### Async access via a hand-rolled `Future`
+
+`kvdb_rt` is deliberately small — a `KvdbCall<R>` future and a `ThreadPoolHandle` channel alias. It is **not** an executor: it provides no run loop and no `Waker` of its own, so it composes with whatever executor you already have.
+
+The mechanism is a manual `Future` implementation. `KvdbCall::poll` dispatches the blocking `kvdb` call to a worker thread on first poll, clones the `Waker` out of the `Context`, and returns `Pending`. The worker runs the closure, writes the result into an `Arc<Mutex<Option<R>>>` slot, and calls `.wake()`. The thread that wakes the task is therefore never the thread that polled it — which is the whole point, and the part that's genuinely easy to get wrong.
+
+`AsyncKvDb` wraps `KvDb` rather than reimplementing it. Each method clones the handle (cheap — it's an `Arc` bump), moves the clone into a `Send + 'static` closure, and hands that to the pool.
+
+`scan()` is the one place this costs something real. The sync `ScanIter` borrows `&S`/`&Value` straight out of the page currently loaded — but a `KvdbCall` job closure must be `Send + 'static` to cross into the pool, and a borrow tied to `&mut self` can't satisfy that. So `AsyncScanIter::next()` clones the key and value once per item and hands back `(S, Value)` instead of `(&S, &Value)`, trading the zero-copy guarantee for the ability to dispatch each traversal step off the calling thread at all.
+
+`lock()`/`unlock()` stay synchronous, deliberately: they're pure type-level relabeling with no I/O, so dispatching them to the pool would add overhead for no parallel work.
+
+## `KvDb` — the synchronous API
+
+```rust
+use kvdb::{KvDb, LendingIterator, Value, ValueError};
+```
+
+### Constructing
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `open` | `fn open(path: &str) -> KvDb<S, Unlocked>` | Creates the file if absent, opens it if present. Returns an **`Unlocked`** handle, so you can write immediately. |
+| `clone` | `fn clone(&self) -> Self` | Clones the *handle*, not the data. All clones share one `Arc<SpinLock<PagerState>>` — hand a clone to another thread to share the same database. |
+
+```rust
+let mut db = KvDb::<i32>::open("data.db");
+```
+
+`S` is the key type and must be `Ord + Clone + Serialize + DeserializeOwned`. Turbofish it on `open` (as above) or let inference pick it up from your first `put`.
+
+### Writing
+
+Only available on `KvDb<S, Unlocked>` — on a `Locked` handle these methods do not exist, and the call fails to compile.
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `put` | `fn put(&mut self, key: S, value: impl Into<Value>)` | Nothing. **Always inserts**, by design — see [`put` vs. `update`](#put-vs-update-insert-only-by-default). |
+| `update` | `fn update(&mut self, key: S, value: impl Into<Value>)` | Nothing. Overwrites the value if the key exists anywhere in the tree, otherwise inserts it. |
+| `delete` | `fn delete(&mut self, key: S) -> (bool, Option<Value>)` | `(found, previous_value)`. Missing key gives `(false, None)`. |
+
+```rust
+db.put(1, "hello".to_string());
+db.put(2, 42i64);
+db.put(3, vec![1u8, 2, 3]);
+
+db.update(2, 43i64);           // overwrites key 2 in place
+db.update(4, "new".to_string()); // key 4 doesn't exist yet, so this inserts it
+
+let (found, old) = db.delete(1);
+assert!(found);
+```
+
+`impl Into<Value>` is what lets you pass `42i64` instead of `Value::I64(42)`. Any type with a `From<T> for Value` impl works — see the [conversion table](#values-and-conversions).
+
+Use `put` when you know the key is new (or duplicates are fine — e.g. an append-only log); use `update` for upsert semantics. `update` costs one extra tree walk to check for the key before deciding whether to overwrite or insert, so it is strictly more expensive than `put`.
+
+### Reading
+
+Available on **both** `Locked` and `Unlocked` handles.
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `get<R>` | `fn get<R>(&mut self, key: &S) -> Result<R, ValueError>` | The value converted to `R`. Borrows the key. |
+| `range` | `fn range(&mut self) -> Vec<(S, Value)>` | Every entry, sorted by key, cloned into a fresh `Vec`. |
+| `len` | `fn len(&mut self) -> usize` | Entry count. Walks the whole tree — it is **not** O(1). |
+| `is_empty` | `fn is_empty(&mut self) -> bool` | `len() == 0`, with the same full-walk cost. |
+
+```rust
+let greeting: String = db.get(&1)?;
+let number: i64 = db.get(&2)?;
+let bytes: Vec<u8> = db.get(&3)?;
+```
+
+The return type drives the conversion: annotate the binding (or turbofish `get::<String>(&1)`) and `R` is inferred. Two failure modes, both `ValueError`:
+
+- `ValueError::NotFound` — no entry for that key.
+- `ValueError::TypeMismatch` — the entry exists but isn't the type you asked for.
+
+`ValueError` implements `std::error::Error` and `Display`, so it works with `?` into a `Box<dyn Error>` or `anyhow`.
+
+These take `&mut self` because acquiring the spinlock needs mutable access to the guarded `Pager` — not because they mutate the logical contents.
+
+### Iterating
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `scan` | `fn scan(&self) -> ScanIter<S>` | A zero-copy in-order cursor. Takes `&self`, not `&mut self`. |
+
+`ScanIter` implements `LendingIterator`, **not** `Iterator` — so the trait must be in scope, and you drive it with `while let`:
+
+```rust
+use kvdb::LendingIterator;
+
+let mut iter = db.scan();
+while let Some((key, value)) = iter.next() {
+    println!("{key}: {value:?}");
+}
+```
+
+`key` and `value` are `&S` and `&Value`, borrowed from the page the iterator currently holds. They're valid until the next `next()` call — which is exactly why this can't be an `Iterator`, and why `.map()`/`.collect()` aren't available. Use `range()` when you want an owned `Vec` and don't mind the clones.
+
+### Lock state transitions
+
+| Method | Signature | Available on |
+|--------|-----------|--------------|
+| `lock` | `fn lock(self) -> KvDb<S, Locked>` | `Unlocked` |
+| `unlock` | `fn unlock(self) -> KvDb<S, Unlocked>` | `Locked` |
+
+Both **consume** `self` and return a differently-typed handle — a method can't retroactively change its own caller's static type, so the new binding is how the state change is recorded.
+
+```rust
+let db = db.lock();
+let number: i64 = db.get(&2)?;   // reads still work
+// db.put(4, "!".to_string());   // compile error: no method `put` on KvDb<i32, Locked>
+
+let mut db = db.unlock();
+db.put(4, "!".to_string());      // fine again
+```
+
+## `AsyncKvDb` — the async API
+
+```rust
+use async_kvdb::{AsyncKvDb, Value, ValueError};
+```
+
+A separate crate, so synchronous-only users never pull in the thread-pool machinery. `async_kvdb` depends on `kvdb`; `kvdb` does not depend on `async_kvdb`.
+
+### Constructing an async handle
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `open` | `fn open(path: &str, num_workers: usize) -> AsyncKvDb<S, Unlocked>` | Opens the file **and** spawns `num_workers` worker threads that live as long as the handle. |
+
+```rust
+let db = AsyncKvDb::<i32>::open("data.db", 4); // 4 worker threads
+```
+
+`S` additionally requires `Send + 'static` here, because keys cross a thread boundary to reach the pool.
+
+### Awaiting operations
+
+Every data method returns a `KvdbCall<R>` — a future that does nothing until awaited. Forgetting the `.await` means the operation never runs.
+
+| Method | Signature | Awaits to |
+|--------|-----------|-----------|
+| `put` | `fn put(&self, key: S, value: impl Into<Value>) -> KvdbCall<()>` | `()`. Always inserts, by design — see [`put` vs. `update`](#put-vs-update-insert-only-by-default). |
+| `update` | `fn update(&self, key: S, value: impl Into<Value>) -> KvdbCall<()>` | `()`. Overwrites if the key exists, inserts otherwise. |
+| `delete` | `fn delete(&self, key: S) -> KvdbCall<(bool, Option<Value>)>` | `(found, previous_value)` |
+| `get<R>` | `fn get<R>(&self, key: S) -> KvdbCall<Result<R, ValueError>>` | `Result<R, ValueError>` |
+| `range` | `fn range(&self) -> KvdbCall<Vec<(S, Value)>>` | Every entry, sorted, cloned |
+| `len` | `fn len(&self) -> KvdbCall<usize>` | Entry count |
+| `is_empty` | `fn is_empty(&self) -> KvdbCall<bool>` | `len() == 0`, same full-walk cost |
+
+`put`/`update`/`delete` exist only on `AsyncKvDb<S, Unlocked>`; `get`/`range`/`len`/`scan` work in either lock state — the same typestate split as the sync API.
+
+```rust
+db.put(1, "hello".to_string()).await;
+db.update(1, "hello, updated".to_string()).await; // overwrites key 1
+
+let value: String = db.get(1).await?;
+let (found, old) = db.delete(1).await;
+let all = db.range().await;
+let count = db.len().await;
+```
+
+### Async iteration
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `scan` | `fn scan(&self) -> AsyncScanIter<S>` | Cursor whose `next()` returns a future. |
+| `AsyncScanIter::next` | `fn next(&mut self) -> NextCall<'_, S>` | Awaits to `Option<(S, Value)>` — **owned**, not borrowed. |
+
+```rust
+let mut iter = db.scan();
+while let Some((key, value)) = iter.next().await {
+    println!("{key}: {value:?}");
+}
+```
+
+No trait import needed here — `next` is an inherent method, unlike the sync side's `LendingIterator`.
+
+### How it differs from `KvDb`
+
+Every method on `KvDb` has a counterpart on `AsyncKvDb`. Where they differ, it falls out of the thread-boundary crossing:
+
+| | `KvDb` | `AsyncKvDb` | Why |
+|---|---|---|---|
+| Receiver | `&mut self` | `&self` | Async methods clone the handle internally before moving it into the job closure. |
+| `get` key | `&S` (borrowed) | `S` (owned) | The job closure must be `Send + 'static`; a borrow can't satisfy that. |
+| `scan` item | `(&S, &Value)` | `(S, Value)` | Same reason — so the async walker clones one key/value per item, giving up the zero-copy guarantee. |
+| Iteration trait | `LendingIterator` | inherent `next` | The async item is owned, so no lending machinery is needed. |
+| `lock`/`unlock` | sync | sync | Pure type-level relabeling; no I/O to offload. |
+| `put`/`update`/`is_empty` | sync | async | Fully symmetric with the sync API — each just dispatches the same tree walk to the pool instead of running it on the calling thread. |
+
+## Values and conversions
 
 ```rust
 pub enum Value {
@@ -68,71 +314,26 @@ pub enum Value {
 }
 ```
 
-The public API hides the enum at both ends rather than making callers construct or match on it directly:
+| Rust type you `put` | Stored as | Read back as |
+|---------------------|-----------|--------------|
+| `i8` / `i32` / `i64` | `I8` / `I32` / `I64` | same type |
+| `u8` / `u32` / `u64` | `UInt8` / `UInt32` / `UInt64` | same type |
+| `f32` / `f64` | `F32` / `F64` | same type |
+| `char` | `Char` | `char` |
+| `String` | `Text` | `String` |
+| `Vec<u8>` | `Bytes` | `Vec<u8>` |
+| `Vec<Value>` | `List` | `Vec<Value>` |
+| `(Vec<Value>, Vec<Value>)` | `Pair` | `(Vec<Value>, Vec<Value>)` |
 
-- **`put`** takes `impl Into<Value>` — `db.put(1, 100)` works without writing `Value::I64(100)`.
-- **`get<R>`** is generic over the return type, bounded by `TryFrom<Value, Error = ValueError>` — `let name: String = db.get(&key)?;` extracts and type-checks in one step. `ValueError::NotFound` covers a missing key; `ValueError::TypeMismatch` covers asking for the wrong type. Numeric extraction widens safely within a signedness/float family (an `I32` value can be read back as an `i64` without a cast) but never silently crosses signed↔unsigned or loses float precision.
-
-`List`/`Pair` make `Value` recursive — a list can contain another list, or a pair of lists — which round-trips through the existing `serde`/`bincode` path with no special-casing needed.
-
-### Real concurrency via a hand-rolled spinlock
-
-`Pager` and `root_id` live together in `PagerState`, wrapped in a `SpinLock<T>` (its own crate, `spinlock`) — `AtomicBool`-based, `compare_exchange` for acquire, a `store` for release, `UnsafeCell<T>` holding the guarded data, and an RAII guard whose `Drop` releases the lock automatically. `unsafe impl Send`/`Sync` is written and justified explicitly, not assumed.
-
-`BTree`/`KvDb` hold this behind an `Arc`, so multiple handles — potentially on different threads — can safely share the same underlying storage. Every public entry point (`put`/`get`/`delete`/`range`/`scan`/`len`) acquires the lock exactly once per call and reads `root_id` fresh from the shared state rather than from a per-clone cached copy — an earlier version cached `root_id` on each `BTree`/`KvDb` clone independently, which could silently go stale after a concurrent split. A separate, earlier bug (fixed first): a version that acquired the lock once per internal helper function, rather than once per public call, deadlocked reliably on any operation that triggered a B-tree split, since a function would try to re-acquire a lock its own caller already held.
-
-### Zero-copy scanning via `LendingIterator`
-
-`range()` returns an owned `Vec<(S, Value)>` — simple, but every key and value gets cloned to build it, even if the caller only wants to iterate once and discard most of the data. `scan()` (in the `scan` crate) avoids that: it borrows each key/value directly out of whichever page is currently loaded, rather than cloning into a fresh collection.
-
-This can't be expressed with `std::iter::Iterator`, because that trait's `Item` type can't borrow from the iterator itself across calls to `next()` — Rust's standard iterator protocol assumes each item is either owned or borrows from something living *outside* the iterator. `scan()`'s items borrow from the iterator's own internal page cache, which changes on every call. That requires a **lending iterator**, implemented here as a small hand-written trait using a Generic Associated Type:
+**Conversions are exact-match.** Reading a value back as any type other than the one it was stored as returns `ValueError::TypeMismatch` — there is no widening, so an `i32` you stored is not readable as an `i64`:
 
 ```rust
-pub trait LendingIterator {
-    type Item<'a> where Self: 'a;
-    fn next<'a>(&'a mut self) -> Option<Self::Item<'a>>;
-}
+db.put(1, 42i32);
+let ok:  i32 = db.get(&1)?;               // fine
+let bad: Result<i64, _> = db.get(&1);     // Err(ValueError::TypeMismatch)
 ```
 
-`ScanIter<S>` implements this with `type Item<'a> = (&'a S, &'a Value)`, walking the tree with an explicit stack (rather than recursion, since `next()` calls can't recurse across separate invocations) and interleaving "descend into child" with "yield this key" in the same order as an in-order traversal.
-
-Because `LendingIterator` isn't `std::iter::Iterator`, `for` loops, `.map()`/`.filter()`/`.collect()`, and everything else in `std::iter` don't work on it directly — a `scan()` loop is written by hand with `while let Some((k, v)) = iter.next() { ... }`. That ergonomics cost is the deliberate tradeoff for the zero-copy guarantee; `range()` stays available (and is now implemented in terms of `scan()` internally) for callers who'd rather pay for the clones and get a plain `Vec` back.
-
-## How to Use
-
-```rust
-let mut db = KvDb::<i32>::open("data.db"); // Unlocked by default
-
-db.put(1, "hello".to_string());
-db.put(2, 42i64);
-db.put(3, vec![1u8, 2, 3]);
-
-let greeting: String = db.get(&1)?;
-let number: i64 = db.get(&2)?;
-let bytes: Vec<u8> = db.get(&3)?;
-
-let (found, old_value) = db.delete(1);
-
-let all_entries = db.range(); // Vec<(S, Value)>, sorted by key, cloned
-
-// zero-copy iteration — requires LendingIterator in scope
-use kvdb::LendingIterator;
-let mut iter = db.scan();
-while let Some((key, value)) = iter.next() {
-    println!("{key}: {value:?}");
-}
-
-// lock()/unlock() consume self and return a differently-typed Self —
-// a method can't retroactively change its own caller's static type.
-let db = db.lock();
-let number: i64 = db.get(&2)?; // get still works locked
-// db.put(4, "!"); // would not compile — put only exists on Unlocked
-
-let mut db = db.unlock();
-db.put(4, "!".to_string());
-```
-
-Values round-trip through `List`/`Pair` too:
+Store the width you intend to read, or convert at the call site. `List`/`Pair` make `Value` recursive — a list can contain another list, or a pair of lists — which round-trips through the existing `serde`/`bincode` path with no special-casing:
 
 ```rust
 let mixed = Value::List(vec![
@@ -147,19 +348,22 @@ let value: Vec<Value> = db.get(&5)?;
 
 ```text
 kvdb/
-  btree/     - the B-tree algorithm and typestate API
-  spinlock/  - the hand-rolled concurrency primitive
-  scan/      - the LendingIterator trait and zero-copy Scan/ScanIter
-  src/       - KvDb, the public wrapper, and Value/ValueError
+  btree/       - the B-tree algorithm, typestate API, Value, and ValueError
+  spinlock/    - the hand-rolled concurrency primitive
+  scan/        - the LendingIterator trait and the shared in-order traversal
+  kvdb_rt/     - the KvdbCall future and thread-pool handle
+  async_kvdb/  - AsyncKvDb, wrapping KvDb with kvdb_rt
+  src/         - KvDb, the public sync entry point
 ```
 
-`KvDb` is the intended way to use this project. `BTree`, `SpinLock`, and `scan` are internal building blocks it's composed from, not separate public-facing interfaces — `kvdb` re-exports what's needed from them (e.g. `LendingIterator`) so consumers never need to depend on the internal crates directly.
+`KvDb` is the intended entry point for synchronous use, `AsyncKvDb` for async. The other four crates are internal: items that must be `pub` for a sibling crate to compile are marked `#[doc(hidden)]`, and struct fields that were previously public (`KvDb::inner`, `BTree::pager_state`, `ScanIter`'s fields) are now private behind accessors.
 
 ## Current Limitations
 
-- No `fsync` on write — pages are flushed to the OS page cache, not guaranteed durable against a power loss immediately after a write.
 - The root page ID isn't persisted across restarts, so reopening an existing file doesn't yet recover previous data.
 - No free list — pages freed by merges or root-shrinking become permanent dead space in the file.
-- I/O and page (de)serialization failures inside `Pager`/`BTree` still panic via `.expect(...)` rather than returning a `Result`; `get`'s `ValueError`-based error handling is the one path already fully `Result`-based.
+- I/O and page (de)serialization failures inside `Pager`/`BTree` still panic via `.expect(...)` rather than returning a `Result`; `get`'s `ValueError` path is the one already fully `Result`-based.
+- Value conversions are exact-match with no widening, so changing a field's width is a breaking change for existing data.
 - Locking is coarse-grained (one `SpinLock` guards the whole `Pager`, not true per-page "crabbing"), and the concurrent test suite currently covers multi-reader/single-writer only.
-- The wire format is hard-coded to `bincode` — a pluggable `Codec` trait (to support e.g. JSON, or a future format migration) is planned but not yet implemented.
+- The wire format is hard-coded to `bincode` — a pluggable `Codec` trait is planned but not yet implemented.
+- The test suite drives futures with its own minimal, busy-polling `block_on` and a no-op `Waker` (see [Async access via a hand-rolled `Future`](#async-access-via-a-hand-rolled-future) for why `kvdb_rt` itself has no executor) — fine for tests, but not a substitute for a real runtime like `tokio` in production.
