@@ -8,3 +8,4 @@ authors.workspace = true
 spinlock = { path = "../spinlock" }
 serde.workspace = true
 bincode.workspace = true
+thiserror.workspace = true

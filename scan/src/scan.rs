@@ -8,12 +8,70 @@ pub trait LendingIterator {
     type Item<'a>
     where
         Self: 'a;
-    fn next<'a>(&'a mut self) -> Option<Self::Item<'a>>;
+    fn next(&mut self) -> Option<Self::Item<'_>>;
 }
+
+#[doc(hidden)]
+pub enum Step {
+    Yield(usize),
+    Descend(PageId),
+    Pop,
+}
+
+#[doc(hidden)]
+pub fn step<S>(node: &Node<S>, idx: usize) -> Step {
+    if node.is_leaf {
+        return if idx < node.keys.len() {
+            Step::Yield(idx)
+        } else {
+            Step::Pop
+        };
+    }
+
+    if idx.is_multiple_of(2) {
+        let child_index = idx / 2;
+        if child_index < node.children.len() {
+            Step::Descend(node.children[child_index])
+        } else {
+            Step::Pop
+        }
+    } else {
+        let key_index = (idx - 1) / 2;
+        if key_index < node.keys.len() {
+            Step::Yield(key_index)
+        } else {
+            Step::Pop
+        }
+    }
+}
+
 pub struct ScanIter<S> {
-    pub pager_state: Arc<SpinLock<PagerState>>,
-    pub stack: Vec<(PageId, usize)>,
-    pub current: Option<Node<S>>,
+    pager_state: Arc<SpinLock<PagerState>>,
+    stack: Vec<(PageId, usize)>,
+    current: Option<Node<S>>,
+}
+
+impl<S> ScanIter<S> {
+    #[doc(hidden)]
+    pub fn new(pager_state: Arc<SpinLock<PagerState>>, root_id: PageId) -> Self {
+        ScanIter {
+            pager_state,
+            stack: vec![(root_id, 0)],
+            current: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (Arc<SpinLock<PagerState>>, Vec<(PageId, usize)>) {
+        (self.pager_state, self.stack)
+    }
+
+    fn advance_cursor(&mut self) {
+        self.stack
+            .last_mut()
+            .expect("stack is non-empty while stepping")
+            .1 += 1;
+    }
 }
 
 impl<S> LendingIterator for ScanIter<S>
@@ -25,7 +83,7 @@ where
     where
         Self: 'a;
 
-    fn next<'a>(&'a mut self) -> Option<Self::Item<'a>> {
+    fn next(&mut self) -> Option<Self::Item<'_>> {
         loop {
             let (page_id, idx) = *self.stack.last()?;
 
@@ -36,37 +94,21 @@ where
                 .read_page::<S>(page_id)
                 .expect("read failed");
             self.current = Some(node);
-            let node = self.current.as_ref().unwrap();
+            let node = self.current.as_ref().expect("just assigned");
 
-            if node.is_leaf {
-                if idx < node.keys.len() {
-                    self.stack.last_mut().unwrap().1 += 1;
-                    let node = self.current.as_ref().unwrap();
-                    return Some((&node.keys[idx], &node.values[idx]));
+            match step(node, idx) {
+                Step::Yield(i) => {
+                    self.advance_cursor();
+                    let node = self.current.as_ref().expect("just assigned");
+                    return Some((&node.keys[i], &node.values[i]));
                 }
-                self.stack.pop();
-                continue;
-            }
-
-            if idx % 2 == 0 {
-                let child_index = idx / 2;
-                if child_index < node.children.len() {
-                    let child_id = node.children[child_index];
-                    self.stack.last_mut().unwrap().1 += 1;
+                Step::Descend(child_id) => {
+                    self.advance_cursor();
                     self.stack.push((child_id, 0));
-                    continue;
                 }
-                self.stack.pop();
-                continue;
-            } else {
-                let key_index = (idx - 1) / 2;
-                if key_index < node.keys.len() {
-                    self.stack.last_mut().unwrap().1 += 1;
-                    let node = self.current.as_ref().unwrap();
-                    return Some((&node.keys[key_index], &node.values[key_index]));
+                Step::Pop => {
+                    self.stack.pop();
                 }
-                self.stack.pop();
-                continue;
             }
         }
     }
@@ -81,11 +123,7 @@ where
     S: Ord + Clone + Serialize + DeserializeOwned,
 {
     fn scan(&self) -> ScanIter<S> {
-        let guard = self.pager_state.acquire();
-        ScanIter {
-            pager_state: Arc::clone(&self.pager_state),
-            stack: vec![(guard.root_id, 0)],
-            current: None,
-        }
+        let root_id = self.pager_state().acquire().root_id;
+        ScanIter::new(Arc::clone(self.pager_state()), root_id)
     }
 }

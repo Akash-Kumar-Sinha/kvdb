@@ -109,8 +109,6 @@ impl TryFrom<Value> for i64 {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::I64(v) => Ok(v),
-            Value::I32(v) => Ok(v as i64),
-            Value::I8(v) => Ok(v as i64),
             _ => Err(ValueError::TypeMismatch),
         }
     }
@@ -121,8 +119,6 @@ impl TryFrom<Value> for i32 {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::I32(v) => Ok(v),
-            Value::I64(v) => i32::try_from(v).map_err(|_| ValueError::TypeMismatch),
-            Value::I8(v) => i32::try_from(v).map_err(|_| ValueError::TypeMismatch),
             _ => Err(ValueError::TypeMismatch),
         }
     }
@@ -133,8 +129,6 @@ impl TryFrom<Value> for i8 {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::I8(v) => Ok(v),
-            Value::I64(v) => i8::try_from(v).map_err(|_| ValueError::TypeMismatch),
-            Value::I32(v) => i8::try_from(v).map_err(|_| ValueError::TypeMismatch),
             _ => Err(ValueError::TypeMismatch),
         }
     }
@@ -145,8 +139,6 @@ impl TryFrom<Value> for u64 {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::UInt64(v) => Ok(v),
-            Value::UInt32(v) => u64::try_from(v).map_err(|_| ValueError::TypeMismatch),
-            Value::UInt8(v) => u64::try_from(v).map_err(|_| ValueError::TypeMismatch),
             _ => Err(ValueError::TypeMismatch),
         }
     }
@@ -157,8 +149,6 @@ impl TryFrom<Value> for u32 {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::UInt32(v) => Ok(v),
-            Value::UInt64(v) => u32::try_from(v).map_err(|_| ValueError::TypeMismatch),
-            Value::UInt8(v) => u32::try_from(v).map_err(|_| ValueError::TypeMismatch),
             _ => Err(ValueError::TypeMismatch),
         }
     }
@@ -169,8 +159,6 @@ impl TryFrom<Value> for u8 {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::UInt8(v) => Ok(v),
-            Value::UInt32(v) => u8::try_from(v).map_err(|_| ValueError::TypeMismatch),
-            Value::UInt64(v) => u8::try_from(v).map_err(|_| ValueError::TypeMismatch),
             _ => Err(ValueError::TypeMismatch),
         }
     }

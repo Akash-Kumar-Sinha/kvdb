@@ -18,6 +18,7 @@ impl Pager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         let len = file.metadata()?.len();
         let next_page_id = len / PAGE_SIZE as u64;
@@ -37,7 +38,11 @@ impl Pager {
         let mut buf = vec![0u8; PAGE_SIZE];
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.read_exact(&mut buf)?;
-        let len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(
+            buf[0..4]
+                .try_into()
+                .expect("buffer always has at least 4 bytes after read"),
+        ) as usize;
         let data = &buf[4..4 + len];
         let node: Node<S> =
             bincode::deserialize(data).expect("corrupt page — see note on checksums below");

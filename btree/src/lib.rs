@@ -11,13 +11,6 @@ pub use value::Value;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pager::Pager;
-
-    #[cfg(test)]
-    fn fresh_pager(path: &str) -> Pager {
-        std::fs::remove_file(path).ok();
-        Pager::open(path).expect("open failed")
-    }
 
     #[test]
     fn test_insertion_structure() {

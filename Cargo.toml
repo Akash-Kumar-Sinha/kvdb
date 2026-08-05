@@ -1,5 +1,5 @@
 [workspace]
-members = ["btree", "scan", "spinlock"]
+members = ["async_kvdb","btree",  "kvdb_rt", "scan", "spinlock"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,8 +10,10 @@ authors = ["Akash Kumar Sinha"]
 btree = { path = "btree" }
 spinlock = { path = "spinlock" }
 scan = { path = "scan" }
+kvdb_rt = { path = "kvdb_rt" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+thiserror = "2"
 
 [package]
 name = "kvdb"
@@ -23,4 +25,3 @@ authors.workspace = true
 btree.workspace = true
 scan.workspace = true
 serde.workspace = true
-

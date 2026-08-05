@@ -16,16 +16,24 @@ pub struct Initialized;
 pub struct Locked;
 pub struct Unlocked;
 
+#[doc(hidden)]
 pub struct PagerState {
     pub pager: Pager,
     pub root_id: PageId,
 }
 
 pub struct BTree<S, State = Uninitialized, LockState = Locked> {
-    pub pager_state: Arc<SpinLock<PagerState>>,
+    pager_state: Arc<SpinLock<PagerState>>,
     state: PhantomData<State>,
     lock_state: PhantomData<LockState>,
     _marker: PhantomData<S>,
+}
+
+impl<S, State, LockState> BTree<S, State, LockState> {
+    #[doc(hidden)]
+    pub fn pager_state(&self) -> &Arc<SpinLock<PagerState>> {
+        &self.pager_state
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -179,6 +187,10 @@ where
         let mut guard = self.pager_state.acquire();
         let root_id = guard.root_id;
         Self::find_len(&mut guard.pager, root_id)
+    }
+
+    pub fn is_empty(&mut self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -356,7 +368,10 @@ where
                 let last = node.keys.len() - 1;
                 return (node.keys[last].clone(), node.values[last].clone());
             }
-            id = *node.children.last().unwrap();
+            id = *node
+                .children
+                .last()
+                .expect("internal node always has children");
         }
     }
 
@@ -431,13 +446,12 @@ where
 
         child.keys.insert(0, parent.keys[idx - 1].clone());
         child.values.insert(0, parent.values[idx - 1].clone());
-        if !left.children.is_empty() {
-            let moved_child = left.children.pop().unwrap();
+        if let Some(moved_child) = left.children.pop() {
             child.children.insert(0, moved_child);
         }
 
-        let left_last_key = left.keys.pop().unwrap();
-        let left_last_val = left.values.pop().unwrap();
+        let left_last_key = left.keys.pop().expect("left sibling has spare keys");
+        let left_last_val = left.values.pop().expect("left sibling has spare values");
         parent.keys[idx - 1] = left_last_key;
         parent.values[idx - 1] = left_last_val;
 
@@ -491,6 +505,25 @@ where
         pager.write_page(parent_id, &parent).expect("write failed");
     }
 
+    fn update_node(pager: &mut Pager, id: PageId, key: &S, value: &Value) -> bool {
+        let mut node: Node<S> = pager.read_page(id).expect("read failed");
+
+        let mut i = 0;
+        while i < node.keys.len() && key > &node.keys[i] {
+            i += 1;
+        }
+        if i < node.keys.len() && key == &node.keys[i] {
+            node.values[i] = value.clone();
+            pager.write_page(id, &node).expect("write failed");
+            return true;
+        }
+        if node.is_leaf {
+            return false;
+        }
+        let child_id = node.children[i];
+        Self::update_node(pager, child_id, key, value)
+    }
+
     pub fn lock(self) -> BTree<S, Initialized, Locked> {
         BTree {
             pager_state: self.pager_state,
@@ -502,6 +535,18 @@ where
 
     pub fn put(&mut self, key: S, value: impl Into<Value>) {
         self.insert(key, value.into());
+    }
+
+    pub fn update(&mut self, key: S, value: impl Into<Value>) {
+        let value = value.into();
+        let updated = {
+            let mut guard = self.pager_state.acquire();
+            let root_id = guard.root_id;
+            Self::update_node(&mut guard.pager, root_id, &key, &value)
+        };
+        if !updated {
+            self.insert(key, value);
+        };
     }
 
     pub fn delete(&mut self, key: S) -> (bool, Option<Value>) {

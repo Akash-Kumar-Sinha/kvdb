@@ -1,16 +1,17 @@
 use std::cell::UnsafeCell;
+use std::hint;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct SpinLock<T> {
-    locked: std::sync::atomic::AtomicBool,
+    locked: AtomicBool,
     data: UnsafeCell<T>,
 }
 
 impl<T> SpinLock<T> {
     pub fn new(value: T) -> Self {
         Self {
-            locked: std::sync::atomic::AtomicBool::new(false),
+            locked: AtomicBool::new(false),
             data: UnsafeCell::new(value),
         }
     }
@@ -21,7 +22,7 @@ impl<T> SpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            std::hint::spin_loop();
+            hint::spin_loop();
         }
         SpinLockGuard { lock: self }
     }
@@ -31,20 +32,20 @@ pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
 }
 
-impl<'a, T> Deref for SpinLockGuard<'a, T> {
+impl<T> Deref for SpinLockGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         unsafe { &*self.lock.data.get() }
     }
 }
 
-impl<'a, T> DerefMut for SpinLockGuard<'a, T> {
+impl<T> DerefMut for SpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.lock.data.get() }
     }
 }
 
-impl<'a, T> Drop for SpinLockGuard<'a, T> {
+impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
     }
