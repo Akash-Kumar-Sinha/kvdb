@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use btree::{BTree, Initialized, Node, PageId, PagerState, Value};
+use btree::{BTree, DbError, Initialized, Node, PageId, PagerState, Value};
 use serde::{Serialize, de::DeserializeOwned};
 use spinlock::SpinLock;
 
@@ -79,7 +79,7 @@ where
     S: Ord + Clone + Serialize + DeserializeOwned,
 {
     type Item<'a>
-        = (&'a S, &'a Value)
+        = Result<(&'a S, &'a Value), DbError>
     where
         Self: 'a;
 
@@ -87,12 +87,13 @@ where
         loop {
             let (page_id, idx) = *self.stack.last()?;
 
-            let node = self
-                .pager_state
-                .acquire()
-                .pager
-                .read_page::<S>(page_id)
-                .expect("read failed");
+            let node = match self.pager_state.acquire().pager.read_page::<S>(page_id) {
+                Ok(node) => node,
+                Err(err) => {
+                    self.stack.clear();
+                    return Some(Err(err));
+                }
+            };
             self.current = Some(node);
             let node = self.current.as_ref().expect("just assigned");
 
@@ -100,7 +101,7 @@ where
                 Step::Yield(i) => {
                     self.advance_cursor();
                     let node = self.current.as_ref().expect("just assigned");
-                    return Some((&node.keys[i], &node.values[i]));
+                    return Some(Ok((&node.keys[i], &node.values[i])));
                 }
                 Step::Descend(child_id) => {
                     self.advance_cursor();
