@@ -1,19 +1,35 @@
-use serde::{Serialize, de::DeserializeOwned};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Result as IoResult, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+use codec::{BincodeCodec, Codec};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::btree::Node;
+use crate::error::DbError;
+use crate::page;
 
 pub type PageId = u64;
+
 const PAGE_SIZE: usize = 4096;
 
+const LEN_PREFIX: usize = 4;
+
+const CAPACITY: usize = PAGE_SIZE - LEN_PREFIX;
+
+#[doc(hidden)]
+#[derive(Debug)]
 pub struct Pager {
     file: File,
     next_page_id: PageId,
+    codec: Box<dyn Codec>,
 }
 
 impl Pager {
-    pub fn open(path: &str) -> IoResult<Self> {
+    pub fn open(path: &str) -> Result<Self, DbError> {
+        Pager::open_with(path, Box::new(BincodeCodec))
+    }
+
+    pub fn open_with(path: &str, codec: Box<dyn Codec>) -> Result<Self, DbError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -22,7 +38,15 @@ impl Pager {
             .open(path)?;
         let len = file.metadata()?.len();
         let next_page_id = len / PAGE_SIZE as u64;
-        Ok(Pager { file, next_page_id })
+        Ok(Pager {
+            file,
+            next_page_id,
+            codec,
+        })
+    }
+
+    pub fn codec(&self) -> &dyn Codec {
+        self.codec.as_ref()
     }
 
     pub fn allocate_page(&mut self) -> PageId {
@@ -31,7 +55,7 @@ impl Pager {
         id
     }
 
-    pub fn read_page<S>(&mut self, id: PageId) -> IoResult<Node<S>>
+    pub fn read_page<S>(&mut self, id: PageId) -> Result<Node<S>, DbError>
     where
         S: DeserializeOwned,
     {
@@ -39,30 +63,38 @@ impl Pager {
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.read_exact(&mut buf)?;
         let len = u32::from_le_bytes(
-            buf[0..4]
+            buf[0..LEN_PREFIX]
                 .try_into()
                 .expect("buffer always has at least 4 bytes after read"),
         ) as usize;
-        let data = &buf[4..4 + len];
-        let node: Node<S> =
-            bincode::deserialize(data).expect("corrupt page — see note on checksums below");
-        Ok(node)
+        if len > CAPACITY {
+            return Err(DbError::CorruptPage {
+                page: id,
+                len,
+                capacity: CAPACITY,
+            });
+        }
+        let data = &buf[LEN_PREFIX..LEN_PREFIX + len];
+
+        let value = self.codec.decode(data)?;
+        Ok(page::from_value(value, self.codec.name())?)
     }
 
-    pub fn write_page<S>(&mut self, id: PageId, node: &Node<S>) -> IoResult<()>
+    pub fn write_page<S>(&mut self, id: PageId, node: &Node<S>) -> Result<(), DbError>
     where
         S: Serialize,
     {
-        let data = bincode::serialize(node).expect("serialize failed");
-        assert!(
-            data.len() + 4 <= PAGE_SIZE,
-            "node too large for one page ({} bytes) — lower MIN_DEGREE \
-             or this key/value type is too big to store inline",
-            data.len()
-        );
+        let data = self.codec.encode(&page::to_value(node)?);
+        if data.len() > CAPACITY {
+            return Err(DbError::PageOverflow {
+                len: data.len(),
+                codec: self.codec.name(),
+                capacity: CAPACITY,
+            });
+        }
         let mut buf = vec![0u8; PAGE_SIZE];
-        buf[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        buf[4..4 + data.len()].copy_from_slice(&data);
+        buf[0..LEN_PREFIX].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        buf[LEN_PREFIX..LEN_PREFIX + data.len()].copy_from_slice(&data);
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.write_all(&buf)?;
         self.file.flush()?;

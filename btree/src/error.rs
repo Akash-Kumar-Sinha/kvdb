@@ -39,7 +39,6 @@ pub enum DbError {
 }
 
 impl DbError {
-    #[must_use]
     pub fn is_not_found(&self) -> bool {
         matches!(self, DbError::Value(ValueError::NotFound))
     }
