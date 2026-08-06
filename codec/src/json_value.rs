@@ -25,14 +25,40 @@ const NAN: &str = "nan";
 const INF: &str = "inf";
 const NEG_INF: &str = "-inf";
 
+/// The newtype that makes `JsonCodec` legal to write at all.
+///
+/// This module needs to convert between `value::Value` and
+/// `serde_json::Value`, and from `codec`'s point of view **both are foreign
+/// types** — neither is defined in this crate. Rust's orphan rule forbids
+/// implementing a foreign trait for a foreign type, so the direct conversion
+/// does not compile:
+///
+/// ```compile_fail,E0117
+/// # use value::Value;
+/// impl From<serde_json::Value> for Value {
+///     fn from(json: serde_json::Value) -> Self {
+///         unimplemented!()
+///     }
+/// }
+/// ```
+///
+/// `Json` is a local newtype wrapping `serde_json::Value`. Because `Json`
+/// itself is local, `impl From<&Value> for Json` and `impl TryFrom<Json> for
+/// Value` are both legal, and every JSON encode/decode in this crate routes
+/// through one of them. This is load-bearing, not illustrative — delete
+/// `Json` and `JsonCodec` cannot be written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Json(JsonValue);
 
 impl Json {
+    /// Borrows the wrapped [`serde_json::Value`].
+    #[must_use]
     pub fn as_json(&self) -> &JsonValue {
         &self.0
     }
 
+    /// Unwraps into the underlying [`serde_json::Value`].
+    #[must_use]
     pub fn into_json(self) -> JsonValue {
         self.0
     }

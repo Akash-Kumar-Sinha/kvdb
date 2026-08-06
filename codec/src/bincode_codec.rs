@@ -2,6 +2,12 @@ use value::{Value, ValueError};
 
 use crate::Codec;
 
+/// The default [`Codec`]: a compact binary format via [`bincode`], and the
+/// codec `Pager::open` uses when none is chosen explicitly.
+///
+/// Delegates directly to `Value`'s derived `Serialize`/`Deserialize`, so a
+/// `Value`'s Rust variant names and layout are part of the wire format —
+/// renaming a variant changes bytes already on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct BincodeCodec;
 

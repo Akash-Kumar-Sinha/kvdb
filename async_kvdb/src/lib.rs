@@ -1,3 +1,55 @@
+//! The async entry point for KvDB: [`AsyncKvDb`], which wraps `kvdb::KvDb` so
+//! every data call runs on a worker thread and returns a future instead of
+//! blocking the caller.
+//!
+//! A separate crate from `kvdb` so synchronous-only users never pull in the
+//! thread-pool machinery: `async_kvdb` depends on `kvdb`, never the reverse.
+//!
+//! # Examples
+//!
+//! ```
+//! use async_kvdb::AsyncKvDb;
+//! # use btree::DbError;
+//! # use std::future::Future;
+//! # use std::pin::Pin;
+//! # use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+//! #
+//! # fn dummy_waker() -> Waker {
+//! #     fn no_op(_: *const ()) {}
+//! #     fn clone(_: *const ()) -> RawWaker { raw() }
+//! #     fn raw() -> RawWaker {
+//! #         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+//! #         RawWaker::new(std::ptr::null(), &VTABLE)
+//! #     }
+//! #     unsafe { Waker::from_raw(raw()) }
+//! # }
+//! # fn block_on<F: Future>(mut future: F) -> F::Output {
+//! #     let waker = dummy_waker();
+//! #     let mut cx = Context::from_waker(&waker);
+//! #     let mut future = unsafe { Pin::new_unchecked(&mut future) };
+//! #     loop {
+//! #         match future.as_mut().poll(&mut cx) {
+//! #             Poll::Ready(val) => return val,
+//! #             Poll::Pending => std::thread::yield_now(),
+//! #         }
+//! #     }
+//! # }
+//! # fn main() -> Result<(), DbError> {
+//! # let path = "/tmp/kvdb_doctest_async_lib.db";
+//! # std::fs::remove_file(path).ok();
+//! let db = AsyncKvDb::<u32>::open(path, 2)?; // 2 worker threads
+//!
+//! block_on(async {
+//!     db.put(1, "hello".to_string()).await?;
+//!     let value: String = db.get(1).await?;
+//!     assert_eq!(value, "hello");
+//!     Ok::<(), DbError>(())
+//! })?;
+//! # std::fs::remove_file(path).ok();
+//! # Ok(())
+//! # }
+//! ```
+
 mod async_kvdb;
 mod async_scan;
 

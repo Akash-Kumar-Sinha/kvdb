@@ -1,3 +1,12 @@
+//! The B+tree storage engine: the typestate-checked [`BTree`], the page-based
+//! [`Pager`], and [`DbError`], the storage-level error the rest of the
+//! workspace propagates.
+//!
+//! This is an internal crate rather than KvDB's public entry point — `kvdb`
+//! re-exports the handful of items an ordinary caller needs. See the
+//! workspace README's "Why a B+tree, not a B-tree" section for why the type
+//! here is still named `BTree` despite no longer being a classic B-tree.
+
 mod btree;
 mod error;
 mod page;

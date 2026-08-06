@@ -1,3 +1,12 @@
+//! A pluggable wire format for [`Value`](value::Value), chosen at runtime instead
+//! of hard-coded into the pager.
+//!
+//! [`Codec`] is the object-safe trait every format implements; [`BincodeCodec`]
+//! and [`JsonCodec`] are the two that ship, and [`CodecRegistry`] maps a
+//! codec's name to a boxed instance so a format can be picked from a config
+//! string rather than a turbofish. [`Json`] is the newtype that makes
+//! `JsonCodec` legal to write at all — see its docs for why.
+
 mod bincode_codec;
 mod codec;
 mod json_codec;

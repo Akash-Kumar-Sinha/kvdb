@@ -2,27 +2,62 @@ use serde::{Deserialize, Serialize};
 
 use crate::ValueError;
 
+/// The closed set of types KvDB can store, so a value is self-describing on
+/// disk rather than an opaque blob.
+///
+/// Conversions to and from Rust types are exact-match, with no widening: a
+/// value stored as [`Value::I32`] does not convert to `i64`. Store the width
+/// you intend to read back, or convert explicitly at the call site.
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in a minor
+/// version, so a `match` over `Value` outside this crate needs a wildcard arm.
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Value {
+    /// A signed 64-bit integer.
     I64(i64),
+    /// A signed 32-bit integer.
     I32(i32),
+    /// A signed 8-bit integer.
     I8(i8),
+    /// An unsigned 64-bit integer.
     UInt64(u64),
+    /// An unsigned 32-bit integer.
     UInt32(u32),
+    /// An unsigned 8-bit integer.
     UInt8(u8),
+    /// A 64-bit float. Round-trips exactly through every codec, including `NaN` and infinities.
     F64(f64),
+    /// A 32-bit float. Round-trips exactly through every codec, including `NaN` and infinities.
     F32(f32),
+    /// A single Unicode scalar value.
     Char(char),
+    /// A UTF-8 string.
     Text(String),
+    /// An arbitrary byte string.
     Bytes(Vec<u8>),
+    /// A list of values, itself recursive: a list can hold another list, or a [`Value::Pair`].
     List(Vec<Value>),
+    /// Two lists paired together, e.g. parallel columns.
     Pair(Vec<Value>, Vec<Value>),
-    // Built by repeated `put`, never by a caller: kept separate from `List` so accumulating cannot splice into a list the caller stored.
+    /// The accumulator built by repeated `put`s of the same key.
+    ///
+    /// Kept as a distinct variant from [`Value::List`] rather than reusing it,
+    /// so that accumulating into an existing key can never be confused with
+    /// splicing into a list the caller stored themselves — the two are
+    /// indistinguishable on the wire if they share a representation. Reading
+    /// this back as `Vec<Value>` works the same as reading a `List`; only the
+    /// write side treats them differently. See `Value::accumulate`.
     Multi(Vec<Value>),
 }
 
 impl Value {
+    /// Folds `value` into `self`, building or extending a [`Value::Multi`].
+    ///
+    /// The first call on a non-`Multi` value wraps both the existing value and
+    /// the new one into `Multi([old, new])`; subsequent calls push onto that
+    /// list. This is what backs `put`'s accumulate-on-repeat-key behaviour —
+    /// see the `kvdb` crate's `KvDb::put`.
     pub fn accumulate(&mut self, value: Value) {
         if let Value::Multi(values) = self {
             values.push(value);
@@ -32,10 +67,18 @@ impl Value {
         *self = Value::Multi(vec![first, value]);
     }
 
+    /// Returns `true` if this value is a [`Value::Multi`] accumulator.
+    #[must_use]
     pub fn is_multi(&self) -> bool {
         matches!(self, Value::Multi(_))
     }
 }
+
+// `From<T> for Value` and `TryFrom<Value> for T` below are what let `KvDb::put`
+// take `impl Into<Value>` and `KvDb::get<R>` return any `R: TryFrom<Value>`,
+// so callers write `db.put(1, 100i64)` instead of `db.put(1, Value::I64(100))`.
+// Each `TryFrom` matches exactly one variant and returns `ValueError::TypeMismatch`
+// otherwise — see the `Value` enum doc for why there is no widening.
 
 impl From<i64> for Value {
     fn from(value: i64) -> Self {

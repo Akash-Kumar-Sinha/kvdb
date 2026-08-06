@@ -3,12 +3,33 @@ use std::hint;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// A mutual-exclusion lock built directly from an [`AtomicBool`], busy-waiting
+/// instead of parking the thread.
+///
+/// KvDB's one use of this type guards `btree::PagerState`: every public entry
+/// point on `BTree`/`KvDb` acquires it exactly once per call. Re-acquiring
+/// while already holding it — even from a nested internal call — deadlocks,
+/// since this lock is not reentrant.
+///
+/// # Examples
+///
+/// ```
+/// use spinlock::SpinLock;
+///
+/// let lock = SpinLock::new(0);
+/// {
+///     let mut guard = lock.acquire();
+///     *guard += 1;
+/// } // guard dropped here, lock released
+/// assert_eq!(*lock.acquire(), 1);
+/// ```
 pub struct SpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
 }
 
 impl<T> SpinLock<T> {
+    /// Wraps `value` in a new, unlocked `SpinLock`.
     pub fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
@@ -16,6 +37,10 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Blocks the calling thread — spinning, not parking — until the lock is
+    /// free, then returns a guard granting exclusive access.
+    ///
+    /// The lock releases automatically when the returned [`SpinLockGuard`] drops.
     pub fn acquire(&self) -> SpinLockGuard<'_, T> {
         while self
             .locked
@@ -28,6 +53,9 @@ impl<T> SpinLock<T> {
     }
 }
 
+/// RAII guard granting exclusive access to a [`SpinLock`]'s contents.
+///
+/// Derefs to `&T`/`&mut T`; releases the lock automatically when dropped.
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
 }
@@ -51,5 +79,8 @@ impl<T> Drop for SpinLockGuard<'_, T> {
     }
 }
 
+// SAFETY: `SpinLock<T>` only exposes `T` through a `SpinLockGuard` obtained by
+// `acquire`, which enforces exclusive access via the atomic `locked` flag —
+// the same guarantee `std::sync::Mutex` relies on to be `Sync` for `T: Send`.
 unsafe impl<T: Send> Send for SpinLock<T> {}
 unsafe impl<T: Send> Sync for SpinLock<T> {}

@@ -1,3 +1,20 @@
+//! KvDB: a disk-backed, embedded key-value store — a B+tree storage engine
+//! with a page-based on-disk format, a compile-time-enforced typestate API,
+//! real thread-safe concurrency, zero-copy scanning, and a pluggable wire
+//! format.
+//!
+//! [`KvDb`] is the type you actually use; see its docs for a complete
+//! example. Everything else re-exported here — [`Value`], [`ValueError`],
+//! [`DbError`], the [`Codec`] types, [`ScanIter`]/[`LendingIterator`] — is
+//! what `KvDb`'s methods take or return. For an async handle that dispatches
+//! calls to a worker pool instead of blocking, see the separate `async_kvdb`
+//! crate's `AsyncKvDb`.
+//!
+//! The full design rationale — why a B+tree, why typestate, why `put`
+//! accumulates, the concurrency model, the codec abstraction — lives in the
+//! workspace README, not here; these doc comments describe *what* each item
+//! does, not *why* the engine is shaped this way.
+
 mod kvdb;
 
 pub use btree::{DbError, Value, ValueError};

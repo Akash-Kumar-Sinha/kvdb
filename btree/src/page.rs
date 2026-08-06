@@ -54,7 +54,7 @@ where
         Value::UInt8(flag) => flag != 0,
         other => return Err(field_error(codec, "is_leaf", &other)),
     };
-    
+
     let keys = list(field(), codec, "keys")?
         .into_iter()
         .map(|key| match key {
@@ -63,9 +63,9 @@ where
             other => Err(field_error(codec, "key", &other)),
         })
         .collect::<Result<Vec<S>, _>>()?;
-    
+
     let values = list(field(), codec, "values")?;
-    
+
     let children = list(field(), codec, "children")?
         .into_iter()
         .map(|child| match child {
@@ -73,7 +73,7 @@ where
             other => Err(field_error(codec, "child", &other)),
         })
         .collect::<Result<Vec<PageId>, _>>()?;
-    
+
     let next = match list(field(), codec, "next")?.as_slice() {
         [] => None,
         [Value::UInt64(id)] => Some(*id),

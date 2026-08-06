@@ -16,6 +16,14 @@ type Item<S> = Result<(S, Value), DbError>;
 type Advanced<S> = (Cursor, Option<Item<S>>);
 type AdvanceJob<S> = Box<dyn FnOnce() -> Advanced<S> + Send>;
 
+/// An async cursor over a tree's entries, sorted by key.
+///
+/// The async counterpart to `scan::ScanIter`. Where the sync cursor lends out
+/// borrowed `(&S, &Value)` pairs, this one hands back owned `(S, Value)` via
+/// [`AsyncScanIter::next`], since each step is dispatched to a worker thread
+/// through a job closure that must be `Send + 'static` — a borrow into this
+/// iterator cannot satisfy that. `next` is an inherent method rather than a
+/// trait method, so no `LendingIterator`-style import is needed to drive it.
 pub struct AsyncScanIter<S> {
     pager_state: Arc<SpinLock<PagerState>>,
     cursor: Cursor,
@@ -63,6 +71,10 @@ where
     }
 }
 
+/// The future returned by [`AsyncScanIter::next`].
+///
+/// Awaits to `None` once the scan is exhausted, or `Some(Err(_))` if a page
+/// could not be read, mirroring `LendingIterator::Item` for the sync cursor.
 pub struct NextCall<'a, S> {
     inner: KvdbCall<Advanced<S>>,
     cursor_slot: &'a mut Cursor,
@@ -90,6 +102,12 @@ impl<S> AsyncScanIter<S>
 where
     S: Ord + Clone + Serialize + DeserializeOwned + Send + 'static,
 {
+    /// Advances the cursor by one step and returns a future for the next
+    /// entry, or `None` once the scan is exhausted.
+    ///
+    /// Each call dispatches one traversal step to the worker pool via the
+    /// same shared `scan::step` function the sync `ScanIter` uses, so the two
+    /// walkers cannot disagree about ordering.
     pub fn next(&mut self) -> NextCall<'_, S> {
         let pager_state = Arc::clone(&self.pager_state);
         let mut cursor = mem::take(&mut self.cursor);

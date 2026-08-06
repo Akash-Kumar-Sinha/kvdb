@@ -3,6 +3,15 @@ use value::{Value, ValueError};
 use crate::Codec;
 use crate::json_value::{self, Json};
 
+/// A tagged, human-readable [`Codec`] backed by [`serde_json`], written to
+/// prove the `Codec` abstraction generalises past `bincode`.
+///
+/// Every value is a single-key tag object, e.g. `{"i64":42}` or
+/// `{"text":"hi"}`, rather than JSON's own untagged numbers and strings —
+/// see the `json_value` module for why a hand-rolled mapping was necessary
+/// instead of `Value`'s derived `Serialize`. A database opened with this
+/// codec is inspectable with `cat` or `jq`, at the cost of larger pages than
+/// `bincode` produces for the same data.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct JsonCodec;
 

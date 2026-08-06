@@ -10,16 +10,39 @@ const MIN_DEGREE: usize = 5;
 const MAX_KEYS: usize = 2 * MIN_DEGREE - 1;
 const MIN_KEYS: usize = MIN_DEGREE - 1;
 
+/// Typestate marker: no root page exists yet — `get`/`put`/`delete`/`range` are not defined.
 pub struct Uninitialized;
+/// Typestate marker: a root page exists — the read/write API is available.
 pub struct Initialized;
+/// Typestate marker: mutating methods (`put`, `delete`) do not exist on this handle.
 pub struct Locked;
+/// Typestate marker: mutating methods are available on this handle.
 pub struct Unlocked;
 
+/// The state one [`SpinLock`] guards: the [`Pager`] and the current root page id.
+///
+/// These live together deliberately — every public entry point acquires the
+/// lock once and reads `root_id` fresh from this shared state, rather than
+/// from a per-clone cached copy that could go stale after a concurrent split.
 pub struct PagerState {
+    /// The pager backing this tree's storage.
     pub pager: Pager,
+    /// The page id of the current root node. Changes when the root splits or shrinks.
     pub root_id: PageId,
 }
 
+/// A disk-backed B+tree, generic over its key type and two compile-time states.
+///
+/// `State` (`Uninitialized`/`Initialized`) and `LockState` (`Locked`/`Unlocked`)
+/// are phantom typestate parameters: methods that don't make sense in a given
+/// state — `put` on a `Locked` handle, any data method on an `Uninitialized`
+/// one — don't exist as methods at all, rather than panicking or returning an
+/// error at runtime. See the crate's typestate `impl` blocks for which methods
+/// are available in which state.
+///
+/// Despite the name, this is a B+tree, not a classic B-tree: values live only
+/// in leaves, and leaves are chained by [`Node::next`] for fast sequential
+/// scans. The name stayed for historical reasons — see the workspace README.
 pub struct BTree<S, State = Uninitialized, LockState = Locked> {
     pager_state: Arc<SpinLock<PagerState>>,
     state: PhantomData<State>,
@@ -28,17 +51,40 @@ pub struct BTree<S, State = Uninitialized, LockState = Locked> {
 }
 
 impl<S, State, LockState> BTree<S, State, LockState> {
+    /// Borrows the shared, lock-guarded pager state underlying this tree.
+    ///
+    /// Exposed for sibling crates (`scan`, `kvdb`) that need to build their
+    /// own cursor over the same storage; not intended for direct use by
+    /// callers of `kvdb`.
     pub fn pager_state(&self) -> &Arc<SpinLock<PagerState>> {
         &self.pager_state
     }
 }
 
+/// One page's worth of the tree: either a leaf holding real entries, or an
+/// internal node holding only routing keys and child pointers.
+///
+/// Both shapes share one struct rather than being separate types — an
+/// internal node with `values` set, or a leaf with `children` set, is a
+/// compile-time-legal but semantically invalid state that only this crate's
+/// `invariants` test module rejects. See `Node::leaf` and `Node::internal`
+/// for the two ways a value of this type is meant to be constructed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Node<S> {
+    /// This node's keys, always kept sorted. In a leaf, `keys[i]` pairs with
+    /// `values[i]`; in an internal node, `keys[i]` separates `children[i]`
+    /// from `children[i + 1]`.
     pub keys: Vec<S>,
+    /// The values stored at each key. Empty for an internal node — values live only in leaves.
     pub values: Vec<Value>,
+    /// Child page ids. Empty for a leaf; `keys.len() + 1` entries for an internal node.
     pub children: Vec<PageId>,
+    /// The next leaf to the right in key order, or `None` for the rightmost
+    /// leaf. Always `None` on an internal node. This is what lets `scan`,
+    /// `range`, and `len` walk the tree as a linked list instead of an
+    /// in-order traversal.
     pub next: Option<PageId>,
+    /// Whether this node is a leaf (`true`) or an internal routing node (`false`).
     pub is_leaf: bool,
 }
 
@@ -112,10 +158,23 @@ impl<S> BTree<S, Uninitialized, Locked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
 {
+    /// Opens (creating if absent) a tree at `path`, using [`BincodeCodec`] as the wire format.
+    ///
+    /// Always allocates a fresh root leaf, whether or not `path` already
+    /// contains data — the root page id is not yet persisted across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Io`] if the file cannot be opened.
     pub fn new(path: &str) -> Result<BTree<S, Initialized, Locked>, DbError> {
         Self::new_with_codec(path, Box::new(BincodeCodec))
     }
 
+    /// Opens (creating if absent) a tree at `path`, with an explicitly chosen [`Codec`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Io`] if the file cannot be opened.
     pub fn new_with_codec(
         path: &str,
         codec: Box<dyn Codec>,
@@ -144,6 +203,7 @@ impl<S> BTree<S, Initialized, Locked>
 where
     S: Ord + Clone + Serialize + DeserializeOwned,
 {
+    /// Consumes a `Locked` tree and returns an `Unlocked` one, at compile time — no I/O.
     pub fn unlock(self) -> BTree<S, Initialized, Unlocked> {
         BTree {
             pager_state: self.pager_state,
@@ -208,6 +268,15 @@ where
         Ok(total)
     }
 
+    /// Every entry, sorted by key, cloned into a fresh `Vec`.
+    ///
+    /// Holds the lock for the whole traversal, so unlike the `scan` crate's
+    /// lending iterator (which re-acquires the lock per step), this always
+    /// sees a consistent tree even under concurrent writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if a page cannot be read or decoded.
     pub fn range(&mut self) -> Result<Vec<(S, Value)>, DbError> {
         let mut result = Vec::new();
         let mut guard = self.pager_state.acquire();
@@ -218,6 +287,13 @@ where
         Ok(result)
     }
 
+    /// Looks up `key` and converts its value to `R`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Value(ValueError::NotFound)` if the key is absent,
+    /// `DbError::Value(ValueError::TypeMismatch)` if the stored value is not
+    /// exactly `R`, or another [`DbError`] variant on an I/O or decode failure.
     pub fn get<R>(&mut self, key: &S) -> Result<R, DbError>
     where
         R: TryFrom<Value, Error = ValueError>,
@@ -227,12 +303,22 @@ where
         Self::search_node(&mut guard.pager, root_id, key)
     }
 
+    /// The number of entries in the tree. Walks every leaf — not O(1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if a page cannot be read or decoded.
     pub fn len(&mut self) -> Result<usize, DbError> {
         let mut guard = self.pager_state.acquire();
         let root_id = guard.root_id;
         Self::find_len(&mut guard.pager, root_id)
     }
 
+    /// `len() == 0`, with the same full-walk cost as [`BTree::len`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if a page cannot be read or decoded.
     pub fn is_empty(&mut self) -> Result<bool, DbError> {
         Ok(self.len()? == 0)
     }
@@ -493,6 +579,7 @@ where
         }
     }
 
+    /// Consumes an `Unlocked` tree and returns a `Locked` one, at compile time — no I/O.
     pub fn lock(self) -> BTree<S, Initialized, Locked> {
         BTree {
             pager_state: self.pager_state,
@@ -502,10 +589,33 @@ where
         }
     }
 
+    /// Inserts `value` under `key`.
+    ///
+    /// If `key` already holds a value, the new value is *accumulated* rather
+    /// than overwriting it: repeated `put`s of the same key fold every value
+    /// into one [`Value::Multi`], readable back as `Vec<Value>`. Use
+    /// [`BTree::update`] for replace-in-place (upsert) semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if a page cannot be read, written, or would
+    /// overflow the fixed page size.
     pub fn put(&mut self, key: S, value: impl Into<Value>) -> Result<(), DbError> {
         self.insert(key, value.into())
     }
 
+    /// Replaces the value at `key` if it exists, otherwise inserts it — upsert semantics.
+    ///
+    /// Unlike [`BTree::put`], a repeat `update` on an existing key discards
+    /// whatever was there (including an accumulator built by `put`) rather
+    /// than folding into it. The lookup and the fallback insert happen under
+    /// one lock acquisition, so concurrent `update`s racing on the same
+    /// absent key cannot both insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if a page cannot be read, written, or would
+    /// overflow the fixed page size.
     pub fn update(&mut self, key: S, value: impl Into<Value>) -> Result<(), DbError> {
         let value = value.into();
         let mut guard = self.pager_state.acquire();
@@ -516,6 +626,12 @@ where
         Self::insert_locked(&mut guard, key, value)
     }
 
+    /// Removes `key` if present, returning `(true, Some(previous_value))`, or
+    /// `(false, None)` if it was absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if a page cannot be read or written.
     pub fn delete(&mut self, key: S) -> Result<(bool, Option<Value>), DbError> {
         let mut guard = self.pager_state.acquire();
         let root_id = guard.root_id;
