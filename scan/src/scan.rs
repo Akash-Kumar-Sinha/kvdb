@@ -11,66 +11,49 @@ pub trait LendingIterator {
     fn next(&mut self) -> Option<Self::Item<'_>>;
 }
 
-#[doc(hidden)]
+pub type Cursor = Option<(PageId, usize)>;
+
 pub enum Step {
     Yield(usize),
-    Descend(PageId),
-    Pop,
+    Goto(PageId),
+    Stop,
 }
 
-#[doc(hidden)]
 pub fn step<S>(node: &Node<S>, idx: usize) -> Step {
-    if node.is_leaf {
-        return if idx < node.keys.len() {
-            Step::Yield(idx)
-        } else {
-            Step::Pop
+    if !node.is_leaf {
+        return match node.children.first() {
+            Some(&leftmost) => Step::Goto(leftmost),
+            None => Step::Stop,
         };
     }
 
-    if idx.is_multiple_of(2) {
-        let child_index = idx / 2;
-        if child_index < node.children.len() {
-            Step::Descend(node.children[child_index])
-        } else {
-            Step::Pop
-        }
+    if idx < node.keys.len() {
+        Step::Yield(idx)
     } else {
-        let key_index = (idx - 1) / 2;
-        if key_index < node.keys.len() {
-            Step::Yield(key_index)
-        } else {
-            Step::Pop
+        match node.next {
+            Some(sibling) => Step::Goto(sibling),
+            None => Step::Stop,
         }
     }
 }
 
 pub struct ScanIter<S> {
     pager_state: Arc<SpinLock<PagerState>>,
-    stack: Vec<(PageId, usize)>,
+    cursor: Cursor,
     current: Option<Node<S>>,
 }
 
 impl<S> ScanIter<S> {
-    #[doc(hidden)]
     pub fn new(pager_state: Arc<SpinLock<PagerState>>, root_id: PageId) -> Self {
         ScanIter {
             pager_state,
-            stack: vec![(root_id, 0)],
+            cursor: Some((root_id, 0)),
             current: None,
         }
     }
 
-    #[doc(hidden)]
-    pub fn into_parts(self) -> (Arc<SpinLock<PagerState>>, Vec<(PageId, usize)>) {
-        (self.pager_state, self.stack)
-    }
-
-    fn advance_cursor(&mut self) {
-        self.stack
-            .last_mut()
-            .expect("stack is non-empty while stepping")
-            .1 += 1;
+    pub fn into_parts(self) -> (Arc<SpinLock<PagerState>>, Cursor) {
+        (self.pager_state, self.cursor)
     }
 }
 
@@ -85,31 +68,25 @@ where
 
     fn next(&mut self) -> Option<Self::Item<'_>> {
         loop {
-            let (page_id, idx) = *self.stack.last()?;
+            let (page_id, idx) = self.cursor?;
 
             let node = match self.pager_state.acquire().pager.read_page::<S>(page_id) {
                 Ok(node) => node,
                 Err(err) => {
-                    self.stack.clear();
+                    self.cursor = None;
                     return Some(Err(err));
                 }
             };
             self.current = Some(node);
-            let node = self.current.as_ref().expect("just assigned");
 
-            match step(node, idx) {
+            match step(self.current.as_ref().expect("just assigned"), idx) {
                 Step::Yield(i) => {
-                    self.advance_cursor();
+                    self.cursor = Some((page_id, idx + 1));
                     let node = self.current.as_ref().expect("just assigned");
                     return Some(Ok((&node.keys[i], &node.values[i])));
                 }
-                Step::Descend(child_id) => {
-                    self.advance_cursor();
-                    self.stack.push((child_id, 0));
-                }
-                Step::Pop => {
-                    self.stack.pop();
-                }
+                Step::Goto(target) => self.cursor = Some((target, 0)),
+                Step::Stop => self.cursor = None,
             }
         }
     }

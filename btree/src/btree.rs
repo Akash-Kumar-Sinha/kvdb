@@ -15,7 +15,6 @@ pub struct Initialized;
 pub struct Locked;
 pub struct Unlocked;
 
-#[doc(hidden)]
 pub struct PagerState {
     pub pager: Pager,
     pub root_id: PageId,
@@ -29,7 +28,6 @@ pub struct BTree<S, State = Uninitialized, LockState = Locked> {
 }
 
 impl<S, State, LockState> BTree<S, State, LockState> {
-    #[doc(hidden)]
     pub fn pager_state(&self) -> &Arc<SpinLock<PagerState>> {
         &self.pager_state
     }
@@ -40,6 +38,7 @@ pub struct Node<S> {
     pub keys: Vec<S>,
     pub values: Vec<Value>,
     pub children: Vec<PageId>,
+    pub next: Option<PageId>,
     pub is_leaf: bool,
 }
 
@@ -48,19 +47,50 @@ where
     S: Ord + Clone + Serialize + DeserializeOwned,
 {
     fn new_leaf(pager: &mut Pager) -> Result<PageId, DbError> {
-        let node: Node<S> = Node {
-            keys: Vec::new(),
-            values: Vec::new(),
-            children: Vec::new(),
-            is_leaf: true,
-        };
+        let node: Node<S> = Node::leaf(Vec::new(), Vec::new(), None);
         let id = pager.allocate_page();
         pager.write_page(id, &node)?;
         Ok(id)
     }
 
+    fn leaf(keys: Vec<S>, values: Vec<Value>, next: Option<PageId>) -> Self {
+        Node {
+            keys,
+            values,
+            children: Vec::new(),
+            next,
+            is_leaf: true,
+        }
+    }
+
+    fn internal(keys: Vec<S>, children: Vec<PageId>) -> Self {
+        Node {
+            keys,
+            values: Vec::new(),
+            children,
+            next: None,
+            is_leaf: false,
+        }
+    }
+
     fn is_full(&self) -> bool {
         self.keys.len() == MAX_KEYS
+    }
+
+    fn child_for(&self, key: &S) -> PageId {
+        self.children[self.child_index(key)]
+    }
+
+    fn child_index(&self, key: &S) -> usize {
+        let mut i = 0;
+        while i < self.keys.len() && key >= &self.keys[i] {
+            i += 1;
+        }
+        i
+    }
+
+    fn slot(&self, key: &S) -> Option<usize> {
+        self.keys.iter().position(|candidate| candidate == key)
     }
 }
 
@@ -132,48 +162,49 @@ where
     where
         R: TryFrom<Value, Error = ValueError>,
     {
-        let node: Node<S> = pager.read_page(id)?;
-
-        let mut i = 0;
-        while i < node.keys.len() && key > &node.keys[i] {
-            i += 1;
+        let leaf: Node<S> = Self::descend_to_leaf(pager, id, key)?;
+        match leaf.slot(key) {
+            Some(i) => Ok(R::try_from(leaf.values[i].clone())?),
+            None => Err(ValueError::NotFound.into()),
         }
-        if i < node.keys.len() && key == &node.keys[i] {
-            return Ok(R::try_from(node.values[i].clone())?);
-        }
-        if node.is_leaf {
-            return Err(ValueError::NotFound.into());
-        }
-        let child_id = node.children[i];
-        Self::search_node(pager, child_id, key)
     }
 
-    fn range_node(
-        pager: &mut Pager,
-        id: PageId,
-        result: &mut Vec<(S, Value)>,
-    ) -> Result<(), DbError> {
-        let node: Node<S> = pager.read_page(id)?;
-
-        for i in 0..node.keys.len() {
-            if !node.is_leaf {
-                Self::range_node(pager, node.children[i], result)?;
+    fn descend_to_leaf(pager: &mut Pager, mut id: PageId, key: &S) -> Result<Node<S>, DbError> {
+        loop {
+            let node: Node<S> = pager.read_page(id)?;
+            if node.is_leaf {
+                return Ok(node);
             }
-            result.push((node.keys[i].clone(), node.values[i].clone()));
+            id = node.child_for(key);
         }
-        if !node.is_leaf {
-            let last_child = node.children[node.keys.len()];
-            Self::range_node(pager, last_child, result)?;
+    }
+
+    fn leftmost_leaf(pager: &mut Pager, mut id: PageId) -> Result<PageId, DbError> {
+        loop {
+            let node: Node<S> = pager.read_page(id)?;
+            if node.is_leaf {
+                return Ok(id);
+            }
+            id = node.children[0];
+        }
+    }
+
+    fn walk_leaves<F>(pager: &mut Pager, root_id: PageId, mut visit: F) -> Result<(), DbError>
+    where
+        F: FnMut(Node<S>),
+    {
+        let mut next = Some(Self::leftmost_leaf(pager, root_id)?);
+        while let Some(id) = next {
+            let leaf: Node<S> = pager.read_page(id)?;
+            next = leaf.next;
+            visit(leaf);
         }
         Ok(())
     }
 
     fn find_len(pager: &mut Pager, id: PageId) -> Result<usize, DbError> {
-        let node: Node<S> = pager.read_page(id)?;
-        let mut total = node.keys.len();
-        for &child_id in &node.children {
-            total += Self::find_len(pager, child_id)?;
-        }
+        let mut total = 0;
+        Self::walk_leaves(pager, id, |leaf| total += leaf.keys.len())?;
         Ok(total)
     }
 
@@ -181,7 +212,9 @@ where
         let mut result = Vec::new();
         let mut guard = self.pager_state.acquire();
         let root_id = guard.root_id;
-        Self::range_node(&mut guard.pager, root_id, &mut result)?;
+        Self::walk_leaves(&mut guard.pager, root_id, |leaf| {
+            result.extend(std::iter::zip(leaf.keys, leaf.values));
+        })?;
         Ok(result)
     }
 
@@ -222,12 +255,7 @@ where
         };
 
         if root_is_full {
-            let new_root_node: Node<S> = Node {
-                keys: Vec::new(),
-                values: Vec::new(),
-                children: vec![root_id],
-                is_leaf: false,
-            };
+            let new_root_node: Node<S> = Node::internal(Vec::new(), vec![root_id]);
             let new_root_id = state.pager.allocate_page();
             state.pager.write_page(new_root_id, &new_root_node)?;
 
@@ -244,33 +272,28 @@ where
         let mut parent: Node<S> = pager.read_page(parent_id)?;
         let child_id = parent.children[i];
         let mut child: Node<S> = pager.read_page(child_id)?;
-
-        let mid_key = child.keys[mid].clone();
-        let mid_val = child.values[mid].clone();
-        let right_keys = child.keys.split_off(mid + 1);
-        let right_vals = child.values.split_off(mid + 1);
-        child.keys.pop();
-        child.values.pop();
-        let right_children = if child.children.is_empty() {
-            Vec::new()
-        } else {
-            child.children.split_off(mid + 1)
-        };
-        let child_is_leaf = child.is_leaf;
-
-        let right_node = Node {
-            keys: right_keys,
-            values: right_vals,
-            children: right_children,
-            is_leaf: child_is_leaf,
-        };
-
         let right_id = pager.allocate_page();
-        pager.write_page(right_id, &right_node)?;
+
+        let separator = if child.is_leaf {
+            let right_keys = child.keys.split_off(mid);
+            let right_values = child.values.split_off(mid);
+            let separator = right_keys[0].clone();
+            let right = Node::leaf(right_keys, right_values, child.next);
+            child.next = Some(right_id);
+            pager.write_page(right_id, &right)?;
+            separator
+        } else {
+            let right_keys = child.keys.split_off(mid + 1);
+            let separator = child.keys.pop().expect("a full node has a middle key");
+            let right_children = child.children.split_off(mid + 1);
+            let right = Node::internal(right_keys, right_children);
+            pager.write_page(right_id, &right)?;
+            separator
+        };
+
         pager.write_page(child_id, &child)?;
 
-        parent.keys.insert(i, mid_key);
-        parent.values.insert(i, mid_val);
+        parent.keys.insert(i, separator);
         parent.children.insert(i + 1, right_id);
         pager.write_page(parent_id, &parent)
     }
@@ -279,6 +302,11 @@ where
         let mut node: Node<S> = pager.read_page(id)?;
 
         if node.is_leaf {
+            if let Some(i) = node.slot(&key) {
+                node.values[i].accumulate(value);
+                return pager.write_page(id, &node);
+            }
+
             let mut i = node.keys.len();
             while i > 0 && key < node.keys[i - 1] {
                 i -= 1;
@@ -288,11 +316,7 @@ where
             return pager.write_page(id, &node);
         }
 
-        let mut i = node.keys.len();
-        while i > 0 && key < node.keys[i - 1] {
-            i -= 1;
-        }
-
+        let mut i = node.child_index(&key);
         let child_id = node.children[i];
         let child_full = {
             let child: Node<S> = pager.read_page(child_id)?;
@@ -302,7 +326,7 @@ where
         if child_full {
             Self::split_child(pager, id, i)?;
             node = pager.read_page(id)?;
-            if key > node.keys[i] {
+            if key >= node.keys[i] {
                 i += 1;
             }
         }
@@ -318,74 +342,20 @@ where
     ) -> Result<(bool, Option<Value>), DbError> {
         let mut node: Node<S> = pager.read_page(id)?;
 
-        let mut i = 0;
-        while i < node.keys.len() && key > node.keys[i] {
-            i += 1;
-        }
-
-        if i < node.keys.len() && key == node.keys[i] {
-            if node.is_leaf {
-                node.keys.remove(i);
-                let val = node.values.remove(i);
-                pager.write_page(id, &node)?;
-                return Ok((true, Some(val)));
-            }
-
-            let left_id = node.children[i];
-            let right_id = node.children[i + 1];
-            let left_len = pager.read_page::<S>(left_id)?.keys.len();
-            let right_len = pager.read_page::<S>(right_id)?.keys.len();
-            let original_val = node.values[i].clone();
-
-            if left_len > MIN_KEYS {
-                let (pred_key, pred_val) = Self::get_predecessor(pager, left_id)?;
-                node.keys[i] = pred_key.clone();
-                node.values[i] = pred_val;
-                pager.write_page(id, &node)?;
-                Self::delete_node(pager, left_id, pred_key)?;
-            } else if right_len > MIN_KEYS {
-                let (succ_key, succ_val) = Self::get_successor(pager, right_id)?;
-                node.keys[i] = succ_key.clone();
-                node.values[i] = succ_val;
-                pager.write_page(id, &node)?;
-                Self::delete_node(pager, right_id, succ_key)?;
-            } else {
-                Self::merge_children(pager, id, i)?;
-                Self::delete_node(pager, left_id, key)?;
-            }
-            return Ok((true, Some(original_val)));
-        }
-
         if node.is_leaf {
-            return Ok((false, None));
+            return match node.slot(&key) {
+                Some(i) => {
+                    node.keys.remove(i);
+                    let value = node.values.remove(i);
+                    pager.write_page(id, &node)?;
+                    Ok((true, Some(value)))
+                }
+                None => Ok((false, None)),
+            };
         }
 
-        let child_id = Self::fill_child(pager, id, i)?;
+        let child_id = Self::fill_child(pager, id, node.child_index(&key))?;
         Self::delete_node(pager, child_id, key)
-    }
-
-    fn get_predecessor(pager: &mut Pager, mut id: PageId) -> Result<(S, Value), DbError> {
-        loop {
-            let node: Node<S> = pager.read_page(id)?;
-            if node.is_leaf {
-                let last = node.keys.len() - 1;
-                return Ok((node.keys[last].clone(), node.values[last].clone()));
-            }
-            id = *node
-                .children
-                .last()
-                .expect("internal node always has children");
-        }
-    }
-
-    fn get_successor(pager: &mut Pager, mut id: PageId) -> Result<(S, Value), DbError> {
-        loop {
-            let node: Node<S> = pager.read_page(id)?;
-            if node.is_leaf {
-                return Ok((node.keys[0].clone(), node.values[0].clone()));
-            }
-            id = node.children[0];
-        }
     }
 
     fn fill_child(pager: &mut Pager, parent_id: PageId, idx: usize) -> Result<PageId, DbError> {
@@ -437,16 +407,21 @@ where
         let mut child: Node<S> = pager.read_page(child_id)?;
         let mut left: Node<S> = pager.read_page(left_id)?;
 
-        child.keys.insert(0, parent.keys[idx - 1].clone());
-        child.values.insert(0, parent.values[idx - 1].clone());
-        if let Some(moved_child) = left.children.pop() {
+        if child.is_leaf {
+            let key = left.keys.pop().expect("left sibling has spare keys");
+            let value = left.values.pop().expect("left sibling has spare values");
+            child.keys.insert(0, key);
+            child.values.insert(0, value);
+            parent.keys[idx - 1] = child.keys[0].clone();
+        } else {
+            child.keys.insert(0, parent.keys[idx - 1].clone());
+            let moved_child = left
+                .children
+                .pop()
+                .expect("internal sibling always has children");
             child.children.insert(0, moved_child);
+            parent.keys[idx - 1] = left.keys.pop().expect("left sibling has spare keys");
         }
-
-        let left_last_key = left.keys.pop().expect("left sibling has spare keys");
-        let left_last_val = left.values.pop().expect("left sibling has spare values");
-        parent.keys[idx - 1] = left_last_key;
-        parent.values[idx - 1] = left_last_val;
 
         pager.write_page(child_id, &child)?;
         pager.write_page(left_id, &left)?;
@@ -460,17 +435,16 @@ where
         let mut child: Node<S> = pager.read_page(child_id)?;
         let mut right: Node<S> = pager.read_page(right_id)?;
 
-        child.keys.push(parent.keys[idx].clone());
-        child.values.push(parent.values[idx].clone());
-        if !right.children.is_empty() {
+        if child.is_leaf {
+            child.keys.push(right.keys.remove(0));
+            child.values.push(right.values.remove(0));
+            parent.keys[idx] = right.keys[0].clone();
+        } else {
+            child.keys.push(parent.keys[idx].clone());
             let moved_child = right.children.remove(0);
             child.children.push(moved_child);
+            parent.keys[idx] = right.keys.remove(0);
         }
-
-        let right_first_key = right.keys.remove(0);
-        let right_first_val = right.values.remove(0);
-        parent.keys[idx] = right_first_key;
-        parent.values[idx] = right_first_val;
 
         pager.write_page(child_id, &child)?;
         pager.write_page(right_id, &right)?;
@@ -484,37 +458,39 @@ where
         let mut left: Node<S> = pager.read_page(left_id)?;
         let right: Node<S> = pager.read_page(right_id)?;
 
-        let mid_key = parent.keys.remove(idx);
-        let mid_val = parent.values.remove(idx);
+        let separator = parent.keys.remove(idx);
         parent.children.remove(idx + 1);
 
-        left.keys.push(mid_key);
-        left.values.push(mid_val);
-        left.keys.extend(right.keys);
-        left.values.extend(right.values);
-        left.children.extend(right.children);
+        if left.is_leaf {
+            left.keys.extend(right.keys);
+            left.values.extend(right.values);
+            left.next = right.next;
+        } else {
+            left.keys.push(separator);
+            left.keys.extend(right.keys);
+            left.children.extend(right.children);
+        }
 
         pager.write_page(left_id, &left)?;
         pager.write_page(parent_id, &parent)
     }
 
     fn update_node(pager: &mut Pager, id: PageId, key: &S, value: &Value) -> Result<bool, DbError> {
-        let mut node: Node<S> = pager.read_page(id)?;
-
-        let mut i = 0;
-        while i < node.keys.len() && key > &node.keys[i] {
-            i += 1;
+        let mut id = id;
+        loop {
+            let mut node: Node<S> = pager.read_page(id)?;
+            if node.is_leaf {
+                return match node.slot(key) {
+                    Some(i) => {
+                        node.values[i] = value.clone();
+                        pager.write_page(id, &node)?;
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                };
+            }
+            id = node.child_for(key);
         }
-        if i < node.keys.len() && key == &node.keys[i] {
-            node.values[i] = value.clone();
-            pager.write_page(id, &node)?;
-            return Ok(true);
-        }
-        if node.is_leaf {
-            return Ok(false);
-        }
-        let child_id = node.children[i];
-        Self::update_node(pager, child_id, key, value)
     }
 
     pub fn lock(self) -> BTree<S, Initialized, Locked> {

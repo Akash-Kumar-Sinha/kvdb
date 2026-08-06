@@ -39,6 +39,106 @@ mod tests {
     }
 
     #[test]
+    fn test_repeated_put_accumulates_into_one_key() -> Result<(), DbError> {
+        let path = "/tmp/test_kvdb_multi_put.db";
+        fresh_path(path);
+
+        let mut db = KvDb::<i32>::open(path)?;
+        db.put(5, 90)?;
+        assert_eq!(db.get::<i32>(&5)?, 90, "a single put stays a plain value");
+
+        db.put(5, 100)?;
+        db.put(5, 8)?;
+        db.put(5, 60)?;
+
+        let all: Vec<Value> = db.get(&5)?;
+        assert_eq!(
+            all,
+            vec![
+                Value::I32(90),
+                Value::I32(100),
+                Value::I32(8),
+                Value::I32(60)
+            ],
+            "every put must be readable, in the order it arrived"
+        );
+
+        assert_eq!(db.len()?, 1, "four puts of one key is still one entry");
+        assert_eq!(db.range()?.len(), 1);
+
+        assert!(
+            db.get::<i32>(&5)
+                .is_err_and(|err| matches!(err, DbError::Value(ValueError::TypeMismatch))),
+            "an accumulated key is no longer a single i32, and must say so"
+        );
+
+        db.update(5, 7)?;
+        assert_eq!(
+            db.get::<i32>(&5)?,
+            7,
+            "update replaces the whole accumulator"
+        );
+
+        fresh_path(path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_accumulation_never_splices_a_stored_list() -> Result<(), DbError> {
+        let path = "/tmp/test_kvdb_multi_vs_list.db";
+        fresh_path(path);
+
+        let mut db = KvDb::<i32>::open(path)?;
+        let stored = Value::List(vec![Value::I32(1), Value::I32(2)]);
+        db.put(1, stored.clone())?;
+        db.put(1, 99i64)?;
+
+        let all: Vec<Value> = db.get(&1)?;
+        assert_eq!(
+            all,
+            vec![stored, Value::I64(99)],
+            "a caller's own List must stay one element, not be spliced into the accumulator"
+        );
+
+        fresh_path(path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_accumulated_keys_survive_a_split() -> Result<(), DbError> {
+        let path = "/tmp/test_kvdb_multi_split.db";
+        fresh_path(path);
+
+        let mut db = KvDb::<i32>::open(path)?;
+        for i in 0..200 {
+            db.put(i, i * 10)?;
+        }
+        for _ in 0..3 {
+            for i in 0..200 {
+                db.put(i, i)?;
+            }
+        }
+
+        assert_eq!(db.len()?, 200, "repeated puts must not create new entries");
+        for i in 0..200 {
+            let all: Vec<Value> = db.get(&i)?;
+            assert_eq!(
+                all,
+                vec![
+                    Value::I32(i * 10),
+                    Value::I32(i),
+                    Value::I32(i),
+                    Value::I32(i)
+                ],
+                "key {i} lost an accumulated value across splits"
+            );
+        }
+
+        fresh_path(path);
+        Ok(())
+    }
+
+    #[test]
     fn test_kvdb_basic_usage() -> Result<(), DbError> {
         let path = "/tmp/test_kvdb_basic_usage.db";
         fresh_path(path);

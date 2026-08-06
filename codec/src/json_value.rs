@@ -19,6 +19,7 @@ const TEXT: &str = "text";
 const BYTES: &str = "bytes";
 const LIST: &str = "list";
 const PAIR: &str = "pair";
+const MULTI: &str = "multi";
 
 const NAN: &str = "nan";
 const INF: &str = "inf";
@@ -107,6 +108,7 @@ fn encode(value: &Value) -> JsonValue {
         Value::Bytes(bytes) => tagged(BYTES, JsonValue::from(to_hex(bytes))),
         Value::List(values) => tagged(LIST, list(values)),
         Value::Pair(left, right) => tagged(PAIR, JsonValue::Array(vec![list(left), list(right)])),
+        Value::Multi(values) => tagged(MULTI, list(values)),
         other => panic!("json codec has no encoding for {other:?}"),
     }
 }
@@ -143,6 +145,7 @@ fn decode(json: &JsonValue) -> Result<Value, ValueError> {
         TEXT => Ok(Value::Text(as_text(body)?.to_owned())),
         BYTES => Ok(Value::Bytes(from_hex(as_text(body)?)?)),
         LIST => Ok(Value::List(as_list(body)?)),
+        MULTI => Ok(Value::Multi(as_list(body)?)),
         PAIR => {
             let (left, right) = as_two(body)?;
             Ok(Value::Pair(as_list(left)?, as_list(right)?))

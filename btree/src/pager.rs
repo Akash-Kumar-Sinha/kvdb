@@ -16,7 +16,6 @@ const LEN_PREFIX: usize = 4;
 
 const CAPACITY: usize = PAGE_SIZE - LEN_PREFIX;
 
-#[doc(hidden)]
 #[derive(Debug)]
 pub struct Pager {
     file: File,

@@ -138,7 +138,7 @@ where
     }
 
     pub fn scan(&self) -> AsyncScanIter<S> {
-        let (pager_state, stack) = self.inner.scan().into_parts();
-        AsyncScanIter::new(pager_state, stack, self.pool.clone())
+        let (pager_state, cursor) = self.inner.scan().into_parts();
+        AsyncScanIter::new(pager_state, cursor, self.pool.clone())
     }
 }

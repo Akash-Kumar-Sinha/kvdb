@@ -1,3 +1,3 @@
 mod scan;
 
-pub use scan::{LendingIterator, Scan, ScanIter, Step, step};
+pub use scan::{Cursor, LendingIterator, Scan, ScanIter, Step, step};

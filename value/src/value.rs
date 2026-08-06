@@ -18,6 +18,23 @@ pub enum Value {
     Bytes(Vec<u8>),
     List(Vec<Value>),
     Pair(Vec<Value>, Vec<Value>),
+    // Built by repeated `put`, never by a caller: kept separate from `List` so accumulating cannot splice into a list the caller stored.
+    Multi(Vec<Value>),
+}
+
+impl Value {
+    pub fn accumulate(&mut self, value: Value) {
+        if let Value::Multi(values) = self {
+            values.push(value);
+            return;
+        }
+        let first = std::mem::replace(self, Value::Multi(Vec::new()));
+        *self = Value::Multi(vec![first, value]);
+    }
+
+    pub fn is_multi(&self) -> bool {
+        matches!(self, Value::Multi(_))
+    }
 }
 
 impl From<i64> for Value {
@@ -218,7 +235,7 @@ impl TryFrom<Value> for Vec<Value> {
     type Error = ValueError;
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
-            Value::List(v) => Ok(v),
+            Value::List(v) | Value::Multi(v) => Ok(v),
             _ => Err(ValueError::TypeMismatch),
         }
     }
